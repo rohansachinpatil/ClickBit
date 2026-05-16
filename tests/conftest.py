@@ -1,16 +1,30 @@
 import pytest
 import os
 import json
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 # -- WorkflowMemory In-Memory DB Fixture --
 @pytest.fixture
 def temp_memory_db(tmp_path):
+    """
+    Provides a WorkflowMemory instance connected to a temporary SQLite file.
+    This prevents tests from polluting the real workflows.db.
+    Also mocks the SemanticMemoryEngine to prevent heavy PyTorch DLL loads during tests.
+    """
     from agent.workflow_memory import WorkflowMemory
-    # Create an instance pointing to a temporary file so it persists across connections
     db_file = tmp_path / "test_workflows.db"
-    memory = WorkflowMemory(db_path=str(db_file))
-    yield memory
+    import sys
+    from unittest.mock import MagicMock
+    
+    # Mock sentence_transformers to prevent heavy PyTorch loads in background threads
+    sys.modules['sentence_transformers'] = MagicMock()
+    
+    with patch('agent.semantic_memory.SemanticMemoryEngine.encode') as mock_encode, \
+         patch('agent.semantic_memory.SemanticMemoryEngine._get_model') as mock_model:
+        # Provide a dummy normalized vector
+        mock_encode.return_value = __import__('numpy').array([1.0, 0.0], dtype=__import__('numpy').float32)
+        memory = WorkflowMemory(db_path=str(db_file))
+        yield memory
 
 # -- Mistral API Mock Fixture --
 @pytest.fixture

@@ -8,10 +8,13 @@ Allows instant recall of repeated tasks.
 import sqlite3
 import json
 import os
+import numpy as np
 from datetime import datetime
 from utils.logger import get_logger
+from agent.semantic_memory import SemanticMemoryEngine
 
 logger = get_logger(__name__)
+SIMILARITY_THRESHOLD = float(os.getenv("SEMANTIC_SIMILARITY_THRESHOLD", "0.82"))
 
 class WorkflowMemory:
     """
@@ -37,8 +40,17 @@ class WorkflowMemory:
                     timestamp DATETIME
                 )
             """)
-            conn.commit()
+            # Add embedding column if upgrading from older version
+            try:
+                cursor.execute("ALTER TABLE workflows ADD COLUMN embedding BLOB")
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass # Column already exists
+                
             conn.close()
+            
+            # Initialize semantic engine lazily
+            self.semantic_engine = SemanticMemoryEngine()
         except Exception as e:
             logger.error(f"Failed to initialize WorkflowMemory: {e}")
 
@@ -56,12 +68,45 @@ class WorkflowMemory:
             conn.close()
             
             if row:
-                logger.info(f"Memory HIT: Found cached plan for '{clean_prompt}'")
+                logger.info(f"Exact Memory HIT: Found cached plan for '{clean_prompt}'")
                 return json.loads(row[0])
         except Exception as e:
-            logger.error(f"Error reading from memory: {e}")
+            logger.error(f"Error reading from exact memory: {e}")
         
-        logger.debug(f"Memory MISS: No cached plan for '{clean_prompt}'")
+        logger.debug(f"Exact Memory MISS: No exact plan for '{clean_prompt}'")
+        
+        # --- Fallback: Semantic Search ---
+        try:
+            # Encode the search prompt
+            query_vec = self.semantic_engine.encode(clean_prompt)
+            
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT prompt, plan, embedding FROM workflows WHERE success = 1 AND embedding IS NOT NULL")
+            rows = cursor.fetchall()
+            conn.close()
+            
+            best_match = None
+            highest_score = -1.0
+            
+            for db_prompt, db_plan, db_embedding_blob in rows:
+                db_vec = np.frombuffer(db_embedding_blob, dtype=np.float32)
+                score = self.semantic_engine.calculate_similarity(query_vec, db_vec)
+                
+                if score > highest_score:
+                    highest_score = score
+                    best_match = (db_prompt, db_plan)
+            
+            if highest_score >= SIMILARITY_THRESHOLD and best_match:
+                logger.info(f"Semantic Memory HIT: '{clean_prompt}' matches '{best_match[0]}' (Score: {highest_score:.2f})")
+                return json.loads(best_match[1])
+            else:
+                if highest_score > 0:
+                    logger.debug(f"Semantic Memory MISS: Best match was '{best_match[0]}' with score {highest_score:.2f} (Threshold: {SIMILARITY_THRESHOLD})")
+                
+        except Exception as e:
+            logger.error(f"Error reading from semantic memory: {e}")
+
         return None
 
     def save_workflow(self, prompt: str, plan: dict, success: bool = True):
@@ -73,14 +118,20 @@ class WorkflowMemory:
         plan_json = json.dumps(plan)
         
         try:
+            embedding = self.semantic_engine.encode(clean_prompt)
+            embedding_blob = embedding.astype(np.float32).tobytes()
+            
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
+            
+            # Using parameter substitution to safely insert
             cursor.execute("""
-                INSERT OR REPLACE INTO workflows (prompt, plan, success, timestamp)
-                VALUES (?, ?, ?, ?)
-            """, (clean_prompt, plan_json, 1 if success else 0, datetime.now()))
+                INSERT OR REPLACE INTO workflows (prompt, plan, success, timestamp, embedding)
+                VALUES (?, ?, ?, ?, ?)
+            """, (clean_prompt, plan_json, 1 if success else 0, datetime.now(), embedding_blob))
+            
             conn.commit()
             conn.close()
-            logger.info(f"Memory SAVED: Workflow for '{clean_prompt}' cached successfully.")
+            logger.info(f"Memory SAVED: Workflow for '{clean_prompt}' cached and embedded successfully.")
         except Exception as e:
             logger.error(f"Failed to save workflow to memory: {e}")
