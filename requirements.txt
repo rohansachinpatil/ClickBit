@@ -1,0 +1,36 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# ClickBit — Python Desktop Assistant
+# requirements.txt
+# ──────────────────────────────────────────────────────────────────────────────
+
+# GUI framework
+PyQt5==5.15.11
+
+# Environment variable loading
+python-dotenv==1.0.1
+
+# Mistral AI SDK
+mistralai>=1.0.0
+
+# Global mouse/keyboard listener (cross-platform)
+pynput==1.7.7
+
+# Browser automation (install Playwright browsers separately — see README)
+playwright==1.44.0
+playwright-stealth==1.0.6
+
+# Desktop automation
+pyautogui==0.9.54
+PyGetWindow==0.0.9         # Required by pyautogui on Windows
+
+# Screenshot support
+Pillow>=11.0.0
+
+# OCR (requires Tesseract binary installed on OS)
+pytesseract==0.3.13
+
+# Testing framework
+pytest>=8.0.0
+pytest-qt>=4.0.0
+pytest-mock>=3.0.0
+coverage>=7.0.0

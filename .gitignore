@@ -1,0 +1,25 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# ── Virtual environments ───────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── Environment variables (NEVER commit real API keys) ────────────────────────
+.env
+
+# ── Logs & screenshots ────────────────────────────────────────────────────────
+clickbit.log
+clickbit.log.*
+screenshots/
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
