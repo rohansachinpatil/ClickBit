@@ -25,7 +25,8 @@ class DebugEventItem(QWidget):
             "success": "✅",
             "error": "❌",
             "retry": "🔄",
-            "info": "ℹ️"
+            "info": "ℹ️",
+            "observation": "👁️"
         }
         self.icon_label.setText(icons.get(event_type, "•"))
         self.icon_label.setFixedWidth(25)

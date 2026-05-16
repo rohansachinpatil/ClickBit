@@ -30,22 +30,7 @@ logger = get_logger(__name__)
 ACTION_DELAY = 1.0
 MAX_RETRIES = 3
 
-class BrowserObservation:
-    def __init__(self, title: str, buttons: list[str], inputs: list[str], links: list[str], text_snippet: str):
-        self.title = title
-        self.buttons = buttons
-        self.inputs = inputs
-        self.links = links
-        self.text_snippet = text_snippet
-
-    def to_dict(self):
-        return {
-            "title": self.title,
-            "buttons": self.buttons[:10],
-            "inputs": self.inputs[:10],
-            "links": self.links[:10],
-            "text": self.text_snippet[:200] + "..."
-        }
+from automation.observer import Observer, BrowserObservation
 
 class BrowserAgent(QObject):
     """
@@ -65,6 +50,7 @@ class BrowserAgent(QObject):
         self._context: BrowserContext = None
         self._page: Page = None
         self._is_executing = False
+        self._observer = Observer()
         logger.info("BrowserAgent Resilient Ready")
 
     @pyqtSlot(list)
@@ -158,9 +144,15 @@ class BrowserAgent(QObject):
                     
                     # Try to stabilize the page before we try again
                     self._recover_state()
+                    
+                    # Look at the page again to see if state changed
+                    self.observe()
                 else:
                     # We tried 3 times, giving up completely.
                     logger.error(f"Final failure for [{cmd}] after {MAX_RETRIES} retries.")
+                    # Take a final screenshot for debugging
+                    if self._is_page_alive():
+                        self._observer.capture_screen(self._page)
         return False
 
     def _recover_state(self):
@@ -193,13 +185,13 @@ class BrowserAgent(QObject):
         try:
             self._ensure_browser()
             if not self._is_page_alive(): return
-            obs = BrowserObservation(
-                self._page.title(),
-                self._page.eval_on_selector_all("button", "(bs) => bs.map(b => b.innerText)"),
-                self._page.eval_on_selector_all("input", "(ins) => ins.map(i => i.placeholder)"),
-                self._page.eval_on_selector_all("a", "(as) => as.map(a => a.innerText)"),
-                self._page.inner_text("body")[:500]
-            )
+            
+            # Use the Vision/Observation Layer
+            obs = self._observer.get_page_state(self._page)
+            
+            # Capture a screenshot of the state just in case
+            self._observer.capture_screen(self._page)
+            
             self.observation_ready.emit(obs)
         except Exception as e:
             logger.error(f"Observation failed: {e}")

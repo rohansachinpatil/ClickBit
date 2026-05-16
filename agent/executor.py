@@ -145,6 +145,7 @@ class Executor(QObject):
         self._browser_agent.action_finished.connect(self._on_execution_finished)
         self._browser_agent.action_error.connect(self._on_execution_error)
         self._browser_agent.status_message.connect(lambda msg: self.agent_event.emit("action", msg, "info"))
+        self._browser_agent.observation_ready.connect(self._on_observation)
         
         self._desktop_agent = DesktopAgent()
         
@@ -246,6 +247,10 @@ class Executor(QObject):
     def _on_execution_error(self, err_msg: str):
         self.agent_event.emit("error", f"Execution Failed: {err_msg}", "error")
         self.task_error.emit(err_msg)
+
+    def _on_observation(self, obs):
+        msg = f"Seen: {len(obs.buttons)} buttons, {len(obs.inputs)} inputs. Title: '{obs.title}'"
+        self.agent_event.emit("observation", msg, "info")
 
     @pyqtSlot()
     def reject_plan(self):
