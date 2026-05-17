@@ -53,6 +53,7 @@ class SelectorResolver:
         self.db_path = db_path
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         self._init_db()
+        self._last_successful_resolution = None
 
     def _init_db(self):
         """Initializes the lightweight SQLite cache database."""
@@ -423,6 +424,20 @@ class SelectorResolver:
         except Exception as e:
             logger.error(f"Failed to decay selector in SQLite: {e}")
 
+    def reinforce_last_successful_resolution(self):
+        """Reinforces the buffered successful resolution in selector history database."""
+        if self._last_successful_resolution:
+            domain, query, sel, sel_type, conf = self._last_successful_resolution
+            self.remember_success(domain, query, sel, sel_type, conf)
+            self._last_successful_resolution = None
+            
+    def decay_last_successful_resolution(self):
+        """Decays the buffered successful resolution's confidence when transition score fails."""
+        if self._last_successful_resolution:
+            domain, query, sel, sel_type, conf = self._last_successful_resolution
+            self.decay_selector(domain, query, sel)
+            self._last_successful_resolution = None
+
     def execute_fallback_chain(self, page, top_candidate: Optional[CandidateElement], query: str, action_type: str = None, argument: str = "") -> Tuple[bool, str, str]:
         """
         Attempts interaction with the top candidate using its CSS selector,
@@ -433,6 +448,7 @@ class SelectorResolver:
             
         domain = self._get_domain(page.url)
         tried_selectors = []
+        self._last_successful_resolution = None
 
         # 1. Primary Attempt (Top candidate)
         if top_candidate:
@@ -441,8 +457,8 @@ class SelectorResolver:
             try:
                 logger.info(f"SelectorResolver: Resolving primary target selector '{sel}'")
                 self._perform_action(page, sel, action_type, argument)
-                # Successful! Cache in interaction memory
-                self.remember_success(domain, query, sel, "css", top_candidate.confidence)
+                # Successful! Buffer in resolution cache for post-action validation
+                self._last_successful_resolution = (domain, query, sel, "css", top_candidate.confidence)
                 return True, sel, f"Success via primary selector: {sel}"
             except Exception as e:
                 logger.warning(f"SelectorResolver: Primary selector '{sel}' failed: {e}. Executing decay & fallbacks...")
@@ -465,7 +481,7 @@ class SelectorResolver:
             try:
                 logger.info(f"SelectorResolver Fallback: Trying alternative candidate CSS '{sel}'")
                 self._perform_action(page, sel, action_type, argument)
-                self.remember_success(domain, query, sel, "css", 0.5)
+                self._last_successful_resolution = (domain, query, sel, "css", 0.5)
                 return True, sel, f"Success via alternative candidate: {sel}"
             except Exception as e:
                 logger.debug(f"SelectorResolver Fallback: Alternative CSS '{sel}' failed: {e}")
@@ -499,17 +515,58 @@ class SelectorResolver:
         return False, "", "All fallback selectors failed"
 
     def _perform_action(self, page, selector: str, action_type: str, argument: str):
-        """Helper to invoke Playwright action using selector."""
-        from automation.element_classifier import ElementClassifier
+        """Helper to invoke Playwright action using selector with multi-factor safety validations."""
+        from automation.element_classifier import ElementClassifier, ElementType
         from automation.ui_state_engine import UIStateEngine
         
         locator = page.locator(selector).first
-        locator.wait_for(state="visible", timeout=5000)
         
-        # 1. Overlay Blocking check
+        # 1. Basic Visibility and Enabled Validations
+        try:
+            locator.wait_for(state="visible", timeout=5000)
+        except Exception as e:
+            raise ResolverExecutionError(f"Target element '{selector}' is not visible after 5s timeout: {e}")
+            
+        if not locator.is_visible():
+            raise ResolverExecutionError(f"Target element '{selector}' failed visibility validation constraint.")
+            
+        if not locator.is_enabled():
+            raise ResolverExecutionError(f"Target element '{selector}' is disabled and cannot receive inputs.")
+
+        # Scroll into view to ensure coordinate calculations are active
+        try:
+            locator.scroll_into_view_if_needed(timeout=2000)
+        except Exception:
+            pass
+
+        # 2. Pointer Interception Detection via document.elementFromPoint
+        rect = locator.bounding_box()
+        if rect:
+            cx = rect["x"] + rect["width"] / 2
+            cy = rect["y"] + rect["height"] / 2
+            
+            is_accessible = page.evaluate("""(sel, x, y) => {
+                const target = document.querySelector(sel);
+                if (!target) return false;
+                const topEl = document.elementFromPoint(x, y);
+                if (!topEl) return true; // fallback
+                return target === topEl || target.contains(topEl) || topEl.contains(target);
+            }""", selector, cx, cy)
+            
+            if not is_accessible:
+                blocker_info = page.evaluate("""(x, y) => {
+                    const el = document.elementFromPoint(x, y);
+                    if (!el) return "unknown";
+                    return el.tagName + (el.id ? '#' + el.id : '') + 
+                           (el.className ? '.' + el.className.split(' ').join('.') : '');
+                }""", cx, cy)
+                raise ResolverExecutionError(
+                    f"Target element '{selector}' is pointer-blocked / intercepted by overlay element: '{blocker_info}' at ({cx:.1f}, {cy:.1f})."
+                )
+
+        # 3. Viewport Overlay Blocking check
         ui_state = UIStateEngine.inspect_page(page)
         if ui_state.pointer_blocked and ui_state.blocker_selector:
-            # Check if selector element is nested under the blocking overlay
             try:
                 is_nested = page.evaluate(f"""(sel, blocker) => {{
                     const el = document.querySelector(sel);
@@ -523,15 +580,28 @@ class SelectorResolver:
                     raise
                 pass
 
-        # 2. Type / Fill safety verification
+        # 4. Semantic Classification Validations
+        classification = ElementClassifier.classify(locator)
+
+        # Type / Fill safety verification
         if action_type in ("type", "fill", "search"):
             if not ElementClassifier.supports_typing(locator):
-                # Raise clean exception to prevent typing into elements that don't support it
-                raise ResolverExecutionError(f"Cannot type/fill into non-editable target element '{selector}' (type: {ElementClassifier.classify(locator).value}).")
+                raise ResolverExecutionError(f"Cannot type/fill into non-editable target element '{selector}' (type: {classification.value}).")
             locator.fill(argument)
             if action_type == "search":
                 locator.press("Enter")
+        # Click safety verification
         elif action_type in ("click", "click_text", "click_index", "click_first_result"):
+            is_clickable = classification in (ElementType.BUTTON, ElementType.LINK, ElementType.SEARCHBOX, ElementType.MENU) or \
+                           page.evaluate("""sel => {
+                               const el = document.querySelector(sel);
+                               if (!el) return false;
+                               const tag = el.tagName.toLowerCase();
+                               const role = el.getAttribute('role') || '';
+                               return tag === 'button' || tag === 'a' || tag === 'input' || role === 'button' || role === 'link' || el.onclick != null;
+                           }""", selector)
+            if not is_clickable:
+                logger.warning(f"Element '{selector}' classification is {classification.value}, which is not standard clickable. Attempting interaction anyway.")
             locator.click(timeout=5000)
         else:
             raise ValueError(f"Unknown action type: {action_type}")

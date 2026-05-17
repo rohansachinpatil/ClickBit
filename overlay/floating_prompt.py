@@ -14,7 +14,7 @@ from PyQt5.QtWidgets import (
     QGraphicsDropShadowEffect, QFrame,
 )
 from utils.logger import get_logger
-from ui.theme import Colors, UIState, Typography, Spacing, Effects
+from ui.theme import Colors, UIState, Typography, Spacing, Effects, CI_MODE
 from ui.components import GlassCard, StatusOrb, IconButton, AnimatedChip
 
 logger = get_logger(__name__)
@@ -37,13 +37,16 @@ class FloatingPrompt(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         
-        self.setWindowFlags(
-            Qt.FramelessWindowHint |      # Frameless
-            Qt.WindowStaysOnTopHint |     # Pinned on top
-            Qt.Tool |                     # No taskbar entry
-            Qt.MSWindowsFixedSizeDialogHint
-        )
-        self.setAttribute(Qt.WA_TranslucentBackground)
+        if CI_MODE:
+            self.setWindowFlags(Qt.Window | Qt.CustomizeWindowHint)
+        else:
+            self.setWindowFlags(
+                Qt.FramelessWindowHint |      # Frameless
+                Qt.WindowStaysOnTopHint |     # Pinned on top
+                Qt.Tool |                     # No taskbar entry
+                Qt.MSWindowsFixedSizeDialogHint
+            )
+            self.setAttribute(Qt.WA_TranslucentBackground)
         self.setFixedSize(580, 150) # Extremely clean, compact spotlight proportions
         
         self._is_planning = False
@@ -193,15 +196,21 @@ class FloatingPrompt(QWidget):
 
         target_pos = QPoint(x + 15, y + 15)
 
-        self.setWindowOpacity(0.0)
-        self.move(target_pos)
-        self.show()
-        self.activateWindow()
-        self.input_field.setFocus()
+        if CI_MODE:
+            self.move(target_pos)
+            self.show()
+            self.activateWindow()
+            self.input_field.setFocus()
+        else:
+            self.setWindowOpacity(0.0)
+            self.move(target_pos)
+            self.show()
+            self.activateWindow()
+            self.input_field.setFocus()
 
-        self.opacity_anim.setStartValue(0.0)
-        self.opacity_anim.setEndValue(1.0)
-        self.opacity_anim.start()
+            self.opacity_anim.setStartValue(0.0)
+            self.opacity_anim.setEndValue(1.0)
+            self.opacity_anim.start()
 
     def _on_submit(self):
         if self._is_planning:

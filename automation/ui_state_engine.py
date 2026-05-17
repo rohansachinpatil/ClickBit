@@ -13,7 +13,9 @@ logger = get_logger(__name__)
 class UIState:
     """Holds a snapshot of the page's current UI layout state and blockages."""
     def __init__(self, overlay_open: bool, modal_visible: bool, active_element_type: str, 
-                 pointer_blocked: bool, visible_inputs: list, clickable_regions: list, blocker_selector: str = ""):
+                 pointer_blocked: bool, visible_inputs: list, clickable_regions: list, blocker_selector: str = "",
+                 is_pointer_blocked: bool = False, blocking_element: str = "", overlay_zindex: int = 0,
+                 viewport_coverage_percent: float = 0.0):
         self.overlay_open = overlay_open
         self.modal_visible = modal_visible
         self.active_element_type = active_element_type
@@ -21,6 +23,12 @@ class UIState:
         self.visible_inputs = visible_inputs
         self.clickable_regions = clickable_regions
         self.blocker_selector = blocker_selector
+        
+        # New attributes required by the Semantic Grounding layer spec
+        self.is_pointer_blocked = is_pointer_blocked
+        self.blocking_element = blocking_element
+        self.overlay_zindex = overlay_zindex
+        self.viewport_coverage_percent = viewport_coverage_percent
 
     def to_dict(self) -> dict:
         return {
@@ -30,7 +38,13 @@ class UIState:
             "pointer_blocked": self.pointer_blocked,
             "visible_inputs": self.visible_inputs,
             "clickable_regions": self.clickable_regions,
-            "blocker_selector": self.blocker_selector
+            "blocker_selector": self.blocker_selector,
+            
+            # New fields
+            "is_pointer_blocked": self.is_pointer_blocked,
+            "blocking_element": self.blocking_element,
+            "overlay_zindex": self.overlay_zindex,
+            "viewport_coverage_percent": self.viewport_coverage_percent
         }
 
 
@@ -53,6 +67,8 @@ class UIStateEngine:
                 let modalVisible = false;
                 let pointerBlocked = false;
                 let blockerSelector = "";
+                let overlayZindex = 0;
+                let viewportCoveragePercent = 0.0;
                 
                 // 1. Precise Modal / Dialog Detection
                 const modalSelectors = [
@@ -70,42 +86,53 @@ class UIStateEngine:
                             modalVisible = true;
                             overlayOpen = true;
                             blockerSelector = selector;
+                            const zIndexVal = parseInt(style.zIndex, 10);
+                            overlayZindex = isNaN(zIndexVal) ? 0 : zIndexVal;
+                            
+                            const overlapX = Math.max(0, Math.min(rect.right, vw) - Math.max(rect.left, 0));
+                            const overlapY = Math.max(0, Math.min(rect.bottom, vh) - Math.max(rect.top, 0));
+                            const overlapArea = overlapX * overlapY;
+                            viewportCoveragePercent = (overlapArea / viewportArea) * 100.0;
                             break;
                         }
                     }
                 }
                 
                 // 2. High Z-Index & Viewport Coverage Interception Analysis
-                for (const el of all) {
-                    if (!el.getBoundingClientRect) continue;
-                    const rect = el.getBoundingClientRect();
-                    if (rect.width <= 10 || rect.height <= 10) continue;
-                    
-                    const style = window.getComputedStyle(el);
-                    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
-                    
-                    // Viewport intersection bounds
-                    const overlapX = Math.max(0, Math.min(rect.right, vw) - Math.max(rect.left, 0));
-                    const overlapY = Math.max(0, Math.min(rect.bottom, vh) - Math.max(rect.top, 0));
-                    const overlapArea = overlapX * overlapY;
-                    const coverage = overlapArea / viewportArea;
-                    
-                    const zIndexVal = parseInt(style.zIndex, 10);
-                    const hasHighZ = !isNaN(zIndexVal) && zIndexVal >= 10;
-                    
-                    // Custom overlay naming patterns (banners, scrims, cookie consent managers)
-                    const isOverlayClass = /[_-]?(overlay|scrim|backdrop|drawer|banner|cookie|popover|dialog)[_-]?/i.test(el.className || "") || 
-                                           /[_-]?(overlay|scrim|backdrop|drawer|banner|cookie|popover|dialog)[_-]?/i.test(el.id || "");
-                    
-                    const isFixedAbs = style.position === 'fixed' || style.position === 'absolute';
-                    
-                    // If fixed/absolute, has high z-index or overlay marker, and covers >= 40% viewport
-                    if (isFixedAbs && (hasHighZ || isOverlayClass) && coverage >= 0.40) {
-                        overlayOpen = true;
-                        pointerBlocked = true;
-                        blockerSelector = el.tagName + (el.id ? '#' + el.id : '') + 
-                                          (el.className ? '.' + el.className.split(' ').join('.') : '');
-                        break;
+                if (!overlayOpen) {
+                    for (const el of all) {
+                        if (!el.getBoundingClientRect) continue;
+                        const rect = el.getBoundingClientRect();
+                        if (rect.width <= 10 || rect.height <= 10) continue;
+                        
+                        const style = window.getComputedStyle(el);
+                        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
+                        
+                        // Viewport intersection bounds
+                        const overlapX = Math.max(0, Math.min(rect.right, vw) - Math.max(rect.left, 0));
+                        const overlapY = Math.max(0, Math.min(rect.bottom, vh) - Math.max(rect.top, 0));
+                        const overlapArea = overlapX * overlapY;
+                        const coverage = overlapArea / viewportArea;
+                        
+                        const zIndexVal = parseInt(style.zIndex, 10);
+                        const hasHighZ = !isNaN(zIndexVal) && zIndexVal >= 10;
+                        
+                        // Custom overlay naming patterns (banners, scrims, cookie consent managers)
+                        const isOverlayClass = /[_-]?(overlay|scrim|backdrop|drawer|banner|cookie|popover|dialog)[_-]?/i.test(el.className || "") || 
+                                               /[_-]?(overlay|scrim|backdrop|drawer|banner|cookie|popover|dialog)[_-]?/i.test(el.id || "");
+                        
+                        const isFixedAbs = style.position === 'fixed' || style.position === 'absolute';
+                        
+                        // If fixed/absolute, has high z-index or overlay marker, and covers >= 40% viewport
+                        if (isFixedAbs && (hasHighZ || isOverlayClass) && coverage >= 0.40) {
+                            overlayOpen = true;
+                            pointerBlocked = true;
+                            blockerSelector = el.tagName + (el.id ? '#' + el.id : '') + 
+                                              (el.className ? '.' + el.className.split(' ').join('.') : '');
+                            overlayZindex = isNaN(zIndexVal) ? 0 : zIndexVal;
+                            viewportCoveragePercent = coverage * 100.0;
+                            break;
+                        }
                     }
                 }
                 
@@ -143,7 +170,9 @@ class UIStateEngine:
                     active_element_type: activeElemType,
                     visible_inputs: [...new Set(visibleInputs)].slice(0, 15),
                     clickable_regions: [...new Set(clickableRegions)].slice(0, 15),
-                    blocker_selector: blockerSelector
+                    blocker_selector: blockerSelector,
+                    overlay_zindex: overlayZindex,
+                    viewport_coverage_percent: viewportCoveragePercent
                 };
             }
             """
@@ -155,7 +184,11 @@ class UIStateEngine:
                 pointer_blocked=data.get("pointer_blocked", False),
                 visible_inputs=data.get("visible_inputs", []),
                 clickable_regions=data.get("clickable_regions", []),
-                blocker_selector=data.get("blocker_selector", "")
+                blocker_selector=data.get("blocker_selector", ""),
+                is_pointer_blocked=data.get("pointer_blocked", False),
+                blocking_element=data.get("blocker_selector", ""),
+                overlay_zindex=data.get("overlay_zindex", 0),
+                viewport_coverage_percent=data.get("viewport_coverage_percent", 0.0)
             )
         except Exception as e:
             logger.error(f"UIStateEngine inspection failed: {e}")
@@ -164,24 +197,44 @@ class UIStateEngine:
     @classmethod
     def detect_overlay(cls, page: Page) -> bool:
         state = cls.inspect_page(page)
-        return state.overlay_open or state.pointer_blocked
+        return state.overlay_open or state.pointer_blocked or state.is_pointer_blocked
+
+    @classmethod
+    def attempt_escape_recovery(cls, page: Page) -> bool:
+        """Attempts to recover by pressing the Escape key to dismiss active overlays."""
+        try:
+            logger.info("[UIStateEngine] Attempting Escape key recovery...")
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(500)
+            return not cls.detect_overlay(page)
+        except Exception as e:
+            logger.error(f"[UIStateEngine] Escape recovery failed: {e}")
+            return False
+
+    @classmethod
+    def scrim_click_recovery(cls, page: Page) -> bool:
+        """Attempts to recover by clicking a neutral viewport area (scrim/backdrop)."""
+        try:
+            logger.info("[UIStateEngine] Attempting outer scrim click recovery...")
+            page.mouse.click(10, 10)
+            page.wait_for_timeout(500)
+            return not cls.detect_overlay(page)
+        except Exception as e:
+            logger.error(f"[UIStateEngine] Scrim click recovery failed: {e}")
+            return False
 
     @classmethod
     def dismiss_overlay(cls, page: Page) -> bool:
         """Resiliently attempts modal / overlay dismissal via keyboard and target click strategies."""
         logger.info("[UIStateEngine] Attempting overlay / modal dismissal recovery cascade...")
         try:
-            # 1. Escape key press
-            page.keyboard.press("Escape")
-            page.wait_for_timeout(500)
-            if not cls.detect_overlay(page):
+            # 1. Escape key recovery
+            if cls.attempt_escape_recovery(page):
                 logger.info("[UIStateEngine] Overlay dismissed successfully via Escape key.")
                 return True
                 
-            # 2. Click outside the modal center (e.g. at absolute viewport border coordinate x=10, y=10)
-            page.mouse.click(10, 10)
-            page.wait_for_timeout(500)
-            if not cls.detect_overlay(page):
+            # 2. Click outside the modal center (scrim/backdrop click)
+            if cls.scrim_click_recovery(page):
                 logger.info("[UIStateEngine] Overlay dismissed successfully via outer scrim-click.")
                 return True
                 

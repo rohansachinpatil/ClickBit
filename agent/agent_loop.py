@@ -440,13 +440,68 @@ class AgentLoopWorker(QObject):
 
     def _execute_action(self, command: str, argument: str) -> bool:
         """Delegates a single action to BrowserAgent and returns success/fail."""
+        import json
         from agent.primitive_router import PrimitiveRouter
         from agent.transition_validator import TransitionValidator
-        
-        # 1. Deterministic Primitive Workflow routing
+        from automation.ui_state_engine import UIStateEngine
+
+        # 0. Active Cooldown Check
+        action_key = f"{command}:{argument}"
+        if self._state.is_action_blacklisted(action_key):
+            telemetry = {
+                "event_type": "action_blacklisted",
+                "payload": {
+                    "action": f"{command}({argument})",
+                    "reason": "Action is currently cooling down on the blacklist."
+                }
+            }
+            self._emit("action_blacklisted", json.dumps(telemetry), "error")
+            return False
+
+        # 1. Overlay Detection & Automatic Recovery Cascade
+        page = self._browser_agent.page
+        if page:
+            try:
+                ui_state = UIStateEngine.inspect_page(page)
+                if ui_state.overlay_open or ui_state.is_pointer_blocked:
+                    telemetry = {
+                        "event_type": "overlay_detected",
+                        "payload": {
+                            "blocking_element": ui_state.blocking_element,
+                            "overlay_zindex": ui_state.overlay_zindex,
+                            "viewport_coverage_percent": ui_state.viewport_coverage_percent
+                        }
+                    }
+                    self._emit("overlay_detected", json.dumps(telemetry), "warning")
+                    
+                    # Attempt automatic recovery dismissals
+                    recovered = UIStateEngine.dismiss_overlay(page)
+                    if recovered:
+                        telemetry_rec = {
+                            "event_type": "overlay_recovered",
+                            "payload": {
+                                "method": "dismiss_overlay_cascade"
+                            }
+                        }
+                        self._emit("overlay_recovered", json.dumps(telemetry_rec), "success")
+                    else:
+                        # If a standard action is about to run but pointer is blocked by overlay, fail/abort early
+                        if not PrimitiveRouter.is_primitive(command) and command not in ("observe", "open_url"):
+                            telemetry_block = {
+                                "event_type": "blocked_interaction",
+                                "payload": {
+                                    "reason": f"Overlay '{ui_state.blocking_element}' could not be dismissed"
+                                }
+                            }
+                            self._emit("blocked_interaction", json.dumps(telemetry_block), "error")
+                            self._state.record_failed_action(action_key, cooldown_duration_sec=30)
+                            return False
+            except Exception as e:
+                logger.error(f"[AgentLoop] Overlay detection/recovery failed: {e}")
+
+        # 2. Deterministic Primitive Workflow routing
         if PrimitiveRouter.is_primitive(command):
             self._emit("primitive_intent", f"Executing deterministic primitive: {command}({argument})", "info")
-            page = self._browser_agent.page
             if not page:
                 logger.error("[AgentLoop] Primitive execution failed: Playwright Page is inactive.")
                 self._emit("primitive_failure", "Playwright page not ready.", "error")
@@ -457,6 +512,18 @@ class AgentLoopWorker(QObject):
                 msg = res.get("message", "No message provided")
                 if success:
                     self._emit("primitive_success", f"✅ {command} successful: {msg}", "success")
+                    
+                    # Emit primitive_executed structured telemetry
+                    telemetry = {
+                        "event_type": "primitive_executed",
+                        "payload": {
+                            "primitive": command,
+                            "argument": argument,
+                            "transition_score": 1.0,
+                            "message": msg
+                        }
+                    }
+                    self._emit("primitive_executed", json.dumps(telemetry), "success")
                 else:
                     self._emit("primitive_failure", f"❌ {command} failed: {msg}", "error")
                 return success
@@ -465,14 +532,32 @@ class AgentLoopWorker(QObject):
                 self._emit("primitive_failure", f"Crash in primitive action: {e}", "error")
                 return False
 
-        # 2. Standard Action execution with Transition Validation
+        # 3. Standard Action execution with Transition Validation
         try:
-            page = self._browser_agent.page
             before_snapshot = None
             if page:
                 before_snapshot = TransitionValidator.take_snapshot(page)
                 
             gen = self._browser_agent.get_session_generation()
+            
+            # Pointer safety check before performing standard interaction
+            if page and command in ("click_text", "click_index", "click_first_result", "type_text", "search"):
+                # We inspect pointer blockage again dynamically just in case
+                ui_state_before = UIStateEngine.inspect_page(page)
+                if ui_state_before.is_pointer_blocked and ui_state_before.blocking_element:
+                    # Unless it's inside the overlay, it's blocked
+                    is_safe = UIStateEngine.validate_interaction_safe(page, ui_state_before.blocker_selector or "body")
+                    if not is_safe:
+                        telemetry_block = {
+                            "event_type": "blocked_interaction",
+                            "payload": {
+                                "reason": f"Pointer event for {command}({argument}) would be intercepted by '{ui_state_before.blocking_element}'"
+                            }
+                        }
+                        self._emit("blocked_interaction", json.dumps(telemetry_block), "error")
+                        self._state.record_failed_action(action_key, cooldown_duration_sec=30)
+                        return False
+
             no_exception = self._browser_agent.execute_single_action(command, argument, expected_generation=gen)
             
             if getattr(self, "_transport_recovered", False):
@@ -489,9 +574,35 @@ class AgentLoopWorker(QObject):
             is_interaction = command in ("click_text", "click_index", "click_first_result", "type_text", "search")
             if is_interaction:
                 success = no_exception and (transition_score >= 0.15)
-                if not success:
-                    action_key = f"{command}:{argument}"
-                    self._emit("ineffective_action", f"⚠️ Ineffective action: {command}({argument}) made no state change (score: {transition_score:.2f}).", "warning")
+                
+                # Interaction memory safety updates
+                if success:
+                    # Enforce transition_verified event
+                    telemetry_verified = {
+                        "event_type": "transition_verified",
+                        "payload": {
+                            "action": f"{command}({argument})",
+                            "transition_score": transition_score
+                        }
+                    }
+                    self._emit("transition_verified", json.dumps(telemetry_verified), "success")
+                    
+                    if self._browser_agent.selector_resolver:
+                        logger.info("[AgentLoop] Transition verified! Reinforcing selector resolution.")
+                        self._browser_agent.selector_resolver.reinforce_last_successful_resolution()
+                else:
+                    if self._browser_agent.selector_resolver:
+                        logger.warning("[AgentLoop] Transition score below threshold! Purging selector resolution.")
+                        self._browser_agent.selector_resolver.decay_last_successful_resolution()
+                        
+                    telemetry_ineffective = {
+                        "event_type": "ineffective_action",
+                        "payload": {
+                            "action": f"{command}({argument})",
+                            "transition_score": transition_score
+                        }
+                    }
+                    self._emit("ineffective_action", json.dumps(telemetry_ineffective), "warning")
                     self._state.record_failed_action(action_key, cooldown_duration_sec=30)
             else:
                 success = no_exception
@@ -504,6 +615,9 @@ class AgentLoopWorker(QObject):
             return False
         except Exception as e:
             logger.error(f"[AgentLoop] Action [{command}({argument})] failed: {e}")
+            # If standard resolver execution or exception is thrown, also decay last successful resolution
+            if self._browser_agent.selector_resolver:
+                self._browser_agent.selector_resolver.decay_last_successful_resolution()
             return False
 
     def _handle_transport_recovery(self):

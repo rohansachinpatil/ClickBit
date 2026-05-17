@@ -25,7 +25,9 @@ class PrimitiveRouter:
             "play_video",
             "play_first_video",
             "dismiss_overlay",
-            "close_modal"
+            "close_modal",
+            "chatgpt_search",
+            "focus_searchbox"
         )
 
     @staticmethod
@@ -42,5 +44,9 @@ class PrimitiveRouter:
             return PrimitiveActions.play_first_video(page, argument)
         elif intent_clean in ("dismiss_overlay", "close_modal"):
             return PrimitiveActions.dismiss_overlay(page, argument)
+        elif intent_clean == "chatgpt_search":
+            return PrimitiveActions.chatgpt_search(page, argument)
+        elif intent_clean == "focus_searchbox":
+            return PrimitiveActions.focus_searchbox(page, argument)
         else:
             raise ValueError(f"Unknown primitive intent: {intent}")

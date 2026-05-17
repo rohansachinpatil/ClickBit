@@ -13,7 +13,8 @@ from PyQt5.QtWidgets import QGraphicsDropShadowEffect
 # Windows DWM has severe heap allocation/repaint bugs when combiningWA_TranslucentBackground
 # frameless layered window resizes, and QGraphicsDropShadowEffect.
 # Standardise on Safe Rendering Mode on Windows.
-SAFE_RENDERING_MODE = sys.platform == "win32" or os.environ.get("CLICKBIT_SAFE_RENDERING", "1") == "1"
+CI_MODE = os.environ.get("CI") == "true"
+SAFE_RENDERING_MODE = sys.platform == "win32" or os.environ.get("CLICKBIT_SAFE_RENDERING", "1") == "1" or CI_MODE
 
 class Effects:
     @staticmethod

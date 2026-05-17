@@ -11,11 +11,36 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QProgressBar)
 from PyQt5.QtCore import Qt, pyqtSlot, QDateTime, pyqtSignal, QSize
 from PyQt5.QtGui import QColor, QFont, QCursor, QPixmap
-from ui.theme import Colors, UIState, Typography, Spacing, Effects, get_svg_pixmap, get_svg_icon
+from ui.theme import Colors, UIState, Typography, Spacing, Effects, get_svg_pixmap, get_svg_icon, CI_MODE
 from ui.components import GlassCard, StatusOrb, IconButton, AnimatedChip
 
 def clean_emoji_prefixes(msg: str) -> str:
     """Strips any legacy emoji prefixes from messages to ensure professional styling."""
+    if msg.strip().startswith("{") and msg.strip().endswith("}"):
+        try:
+            import json
+            data = json.loads(msg)
+            evt = data.get("event_type", "")
+            payload = data.get("payload", {})
+            if evt == "primitive_executed":
+                return f"Executed primitive '{payload.get('primitive')}' (score: {payload.get('transition_score', 0.0):.2f})"
+            elif evt == "transition_verified":
+                return f"Transition verified (score: {payload.get('transition_score', 0.0):.2f})"
+            elif evt == "ineffective_action":
+                return f"Action was ineffective: {payload.get('action')}"
+            elif evt == "overlay_detected":
+                return f"Overlay detected: '{payload.get('blocking_element')}' (z-index: {payload.get('overlay_zindex')})"
+            elif evt == "overlay_recovered":
+                return f"Overlay dismissed successfully"
+            elif evt == "blocked_interaction":
+                return f"Blocked: {payload.get('reason')}"
+            elif evt == "action_blacklisted":
+                return f"Blacklisted action: {payload.get('action')}"
+            else:
+                return f"{evt}: {json.dumps(payload)}"
+        except Exception:
+            pass
+
     emojis = ["🚀", "📋", "🔄", "👁", "✅", "🛑", "❌", "⚡", "💭", "⚠️", "🎯", "•", "🧠", "📦", "🛠", "🧩"]
     for e in emojis:
         msg = msg.replace(e, "")
@@ -50,6 +75,14 @@ class DebugEventItem(QWidget):
         "primitive_failure": ("x", Colors.RED),
         "transition_score": ("activity", Colors.BLUE),
         "ineffective_action": ("alert_triangle", Colors.AMBER),
+        
+        # New Structured Telemetry event types
+        "primitive_executed": ("play", Colors.BLUE),
+        "transition_verified": ("activity", Colors.GREEN),
+        "overlay_detected": ("alert_triangle", Colors.AMBER),
+        "overlay_recovered": ("check", Colors.GREEN),
+        "blocked_interaction": ("x", Colors.RED),
+        "action_blacklisted": ("stop_circle", Colors.RED),
     }
 
     def __init__(self, timestamp: str, event_type: str, message: str):
@@ -110,8 +143,11 @@ class DebugPanel(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("ClickBit Dashboard")
-        self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
-        self.setAttribute(Qt.WA_TranslucentBackground)
+        if CI_MODE:
+            self.setWindowFlags(Qt.Window | Qt.CustomizeWindowHint)
+        else:
+            self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
+            self.setAttribute(Qt.WA_TranslucentBackground)
         self.resize(450, 620)
 
         root = QVBoxLayout(self)

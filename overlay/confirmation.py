@@ -11,7 +11,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QSize
 from PyQt5.QtGui import QFont, QCursor, QPixmap
-from ui.theme import Colors, Typography, Spacing, Effects, get_svg_pixmap
+from ui.theme import Colors, Typography, Spacing, Effects, get_svg_pixmap, CI_MODE
 from ui.components import GlassCard
 
 class ConfirmationDialog(QDialog):
@@ -23,8 +23,11 @@ class ConfirmationDialog(QDialog):
 
     def __init__(self, steps: list[str], parent=None):
         super().__init__(parent)
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Dialog)
-        self.setAttribute(Qt.WA_TranslucentBackground)
+        if CI_MODE:
+            self.setWindowFlags(Qt.Dialog)
+        else:
+            self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Dialog)
+            self.setAttribute(Qt.WA_TranslucentBackground)
         
         self.steps = steps
         self._init_ui()

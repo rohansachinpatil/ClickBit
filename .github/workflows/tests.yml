@@ -4,6 +4,10 @@ on:
   push:
   pull_request:
 
+env:
+  QT_QPA_PLATFORM: offscreen
+  CI: true
+
 jobs:
   test:
     runs-on: ubuntu-latest

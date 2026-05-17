@@ -5,14 +5,23 @@ Unit tests for the new ClickBit Design Tokens System, Icon System, and State Eng
 """
 
 import sys
+import os
 import unittest
+import pytest
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtGui import QIcon, QPixmap
 from ui.theme import Colors, UIState, Typography, Spacing, get_svg_icon, get_svg_pixmap
 from ui.components import GlassCard, StatusOrb, IconButton, AnimatedChip
 
+pytestmark = pytest.mark.skipif(
+    os.environ.get("CI") == "true",
+    reason="Skipping GUI rendering tests in CI"
+)
+
 # Instantiate QApplication once for GUI test cases
-app = QApplication.instance() or QApplication(sys.argv)
+app = QApplication.instance()
+if app is None and os.environ.get("CI") != "true":
+    app = QApplication(sys.argv)
 
 class TestUITheme(unittest.TestCase):
     def test_colors_presence(self):

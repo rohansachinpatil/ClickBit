@@ -35,6 +35,7 @@ MAX_RETRIES = 3
 
 from automation.observer import Observer, BrowserObservation
 from automation.selector_resolver import SelectorResolver, ResolverExecutionError
+from ui.theme import CI_MODE
 
 class BrowserSessionState(Enum):
     DEAD = "dead"
@@ -84,6 +85,10 @@ class BrowserAgent(QObject):
     @property
     def page(self) -> Optional[Page]:
         return self._page
+
+    @property
+    def selector_resolver(self) -> SelectorResolver:
+        return self._selector_resolver
 
     @pyqtSlot(list)
     def execute(self, steps: list) -> None:
@@ -382,11 +387,18 @@ class BrowserAgent(QObject):
                 if self._playwright is None:
                     self._session_state = BrowserSessionState.STARTING
                     logger.info("Initializing new Playwright session...")
-                    self._playwright = sync_playwright().start()
-                    self._browser = self._playwright.chromium.launch(
-                        headless=self._headless, 
-                        args=["--no-sandbox", "--disable-gpu", "--no-first-run"]
-                    )
+                    try:
+                        self._playwright = sync_playwright().start()
+                        launch_args = ["--no-sandbox", "--disable-gpu", "--no-first-run"]
+                        if CI_MODE:
+                            launch_args.append("--disable-dev-shm-usage")
+                        self._browser = self._playwright.chromium.launch(
+                            headless=True if CI_MODE else self._headless, 
+                            args=launch_args
+                        )
+                    except Exception as playwright_err:
+                        logger.error(f"[BrowserAgent] CRITICAL: Failed to launch Playwright Chromium: {playwright_err}", exc_info=True)
+                        raise
                 if self._context is None:
                     self._context = self._browser.new_context(viewport={"width": 1280, "height": 800})
                 if self._page is None or self._page.is_closed():
