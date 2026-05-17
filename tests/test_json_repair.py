@@ -155,6 +155,18 @@ def test_validate_action_schema():
     assert validated_empty["confidence"] == 0.5
     assert validated_empty["argument"] == ""
 
+    # Primitive commands survival
+    data_primitive = {
+        "reasoning": "Searching...",
+        "confidence": 0.9,
+        "command": "youtube_search",
+        "argument": "lo-fi coding music"
+    }
+    validated_prim, warnings_prim = validate_action_schema(data_primitive)
+    assert not warnings_prim
+    assert validated_prim["command"] == "youtube_search"
+    assert validated_prim["argument"] == "lo-fi coding music"
+
 def test_persist_malformed_output():
     out_dir = "tmp/malformed_outputs"
     # Ensure dir cleaned up initially

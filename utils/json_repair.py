@@ -23,7 +23,17 @@ VALID_COMMANDS = {
     "click_index",
     "click_first_result",
     "type_text",
-    "task_complete"
+    "task_complete",
+    "scroll",
+    "wait",
+
+    # deterministic primitives
+    "youtube_search",
+    "google_search",
+    "play_video",
+    "dismiss_overlay",
+    "close_modal",
+    "focus_searchbox"
 }
 
 def extract_json_block(text: str) -> str:

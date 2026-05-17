@@ -2,6 +2,7 @@ import os
 import json
 from pathlib import Path
 from utils.logger import get_logger
+from automation.js_bridge import safe_evaluate
 
 logger = get_logger(__name__)
 
@@ -112,7 +113,7 @@ class Observer:
             }
             """
             
-            data = page.evaluate(script)
+            data = safe_evaluate(page, script)
             return BrowserObservation(
                 title=data.get("title", ""),
                 buttons=data.get("buttons", []),

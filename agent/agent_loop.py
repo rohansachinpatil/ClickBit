@@ -28,6 +28,9 @@ from .intervention import InterventionReason
 from datetime import datetime
 from agent.action_decider   import ActionDecider
 from agent.goal_planner     import GoalPlanner, SubGoal
+from agent.transition_validator import TransitionValidator, TransitionSnapshot
+from agent.primitive_router import PrimitiveRouter
+from automation.execution_recorder import ExecutionRecorder, ExecutionFrame
 from utils.logger           import get_logger
 
 logger = get_logger(__name__)
@@ -60,6 +63,9 @@ class AgentLoopWorker(QObject):
 
     def __init__(self, goal: str, browser_agent, parent=None):
         super().__init__(parent)
+        from agent.skill_memory import SemanticRetrievalLayer, WorkflowCompressionEngine
+        from agent.skill_executor import SkillExecutor
+        
         self._goal           = goal
         self._browser_agent  = browser_agent
         self._browser_agent.status_message.connect(self._handle_status_message)
@@ -68,6 +74,13 @@ class AgentLoopWorker(QObject):
         self._goal_planner   = GoalPlanner()
         self._waiting        = False   # True while waiting for clarification reply
         self._waiting_intervention = False # True while waiting for human intervention
+        self._recorder       = ExecutionRecorder()
+        
+        self._memory_layer   = SemanticRetrievalLayer()
+        self._skill_executor = SkillExecutor(self._browser_agent, self._memory_layer)
+        
+        # Start recording session
+        self._state.session_id = self._recorder.start_session(goal)
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -153,6 +166,18 @@ class AgentLoopWorker(QObject):
             if self._state.current_subgoal_index >= len(self._state.subgoals):
                 self._state.status = AgentStatus.COMPLETED
                 self._emit("success", "✅ All planned subgoals achieved! Task complete.", "success")
+                
+                # Auto-compress successful trajectory into a reusable skill
+                try:
+                    self._recorder.stop_session(completed=True)
+                    session_data = ExecutionRecorder.load_session(self._state.session_id)
+                    skill = WorkflowCompressionEngine.compress_trajectory(session_data)
+                    if skill:
+                        self._memory_layer.store_skill(skill)
+                        self._emit("success", f"🧠 Successfully learned and compressed skill: {skill.name}", "success")
+                except Exception as e:
+                    logger.error(f"[AgentLoop] Failed to compress skill: {e}")
+                    
                 self.loop_finished.emit(self._goal)
                 return
 
@@ -166,15 +191,41 @@ class AgentLoopWorker(QObject):
             # ════════════════════════════════════════════════════════════════════
             # PHASE 1: OBSERVE
             # ════════════════════════════════════════════════════════════════════
+            frame = ExecutionFrame(iteration=self._state.iteration)
+            
             self._state.status = AgentStatus.OBSERVING
             self._emit("observation", "👁 Observing page...", "info")
 
+            obs_start = time.perf_counter()
             obs = self._get_observation()
+            frame.observe_latency_ms = int((time.perf_counter() - obs_start) * 1000)
+            
             if getattr(self, "_transport_recovered", False):
                 continue
             self._state.latest_observation = obs.get("text", "")
             self._state.page_title         = obs.get("title", "")
             self._state.current_url        = obs.get("url", "")
+            
+            # Snap before state
+            frame.before_state = {
+                "url": self._state.current_url,
+                "title": self._state.page_title,
+                "text_summary": self._state.latest_observation,
+                "buttons": obs.get("buttons", []),
+                "inputs": obs.get("inputs", [])
+            }
+            
+            # Take before screenshot
+            page = self._browser_agent._page
+            if page and not page.is_closed():
+                frame.before_screenshot_path = f"frame_{frame.iteration}_before.jpg"
+                full_path = os.path.join(self._recorder.screenshots_dir, frame.before_screenshot_path)
+                ExecutionRecorder.capture_and_compress_screenshot(page, full_path)
+                
+                # Take transition validator snapshot before
+                self._state.before_snapshot = TransitionValidator.take_snapshot(page)
+                frame.before_state["active_element"] = self._state.before_snapshot.active_element
+                frame.before_state["modal_state"] = self._state.before_snapshot.modal_state
 
             obs_summary = (
                 f"Title: '{self._state.page_title}' | "
@@ -231,6 +282,7 @@ class AgentLoopWorker(QObject):
             # PHASE 2: THINK
             # ════════════════════════════════════════════════════════════════════
             self._state.status = AgentStatus.THINKING
+            think_start = time.perf_counter()
             
             # If subgoal has prepopulated/queued steps, pop and execute!
             if subgoal.steps:
@@ -248,44 +300,70 @@ class AgentLoopWorker(QObject):
                     "info"
                 )
             else:
-                # Ask Decider (Mistral) for the next action to accomplish the subgoal
-                self._state.compressed_history = self._goal_planner.compress_roadmap(self._state.subgoals)
-                
-                if self._state.detect_stall():
-                    self._emit("warning", "⚠️ Loop stall warning: Agent is repeating identical steps without progress.", "warning")
-                self._emit("planning", f"🧠 Reasoning how to complete subgoal: {subgoal.title}...", "info")
-
-                action = self._decider.decide(self._state)
-
-                # Process Structured Output Reliability Pipeline Telemetry & Events
-                if action.get("was_repaired"):
-                    self._emit("json_repair", "🛠 Repaired malformed LLM JSON block.", "info")
-                    
-                if action.get("has_warnings"):
-                    warnings = action.get("warnings", [])
-                    if "Complete JSON parse failure." in warnings:
-                        self._emit("malformed_output", "🧩 Complete parse failure! Safe fallback to observe.", "warning")
-                        self._state.consecutive_malformed += 1
-                        if self._state.consecutive_malformed >= 2:
-                            self._emit("warning", f"⚠️ Consecutive malformed outputs ({self._state.consecutive_malformed}). Clearing reasoning cache.", "warning")
-                            self._decider._cache.clear()
-                    else:
-                        for warn in warnings:
-                            self._emit("schema_warning", f"⚠️ Schema Warning: {warn}", "warning")
-                        self._state.consecutive_malformed = 0
-                else:
-                    self._state.consecutive_malformed = 0
-
-                self._state.latest_reasoning  = action.get("reasoning",  "")
-                self._state.latest_confidence = action.get("confidence", 0.5)
-                self._state.latest_command    = action.get("command",    "observe")
-                self._state.latest_argument   = action.get("argument",   "")
-
-                self._emit(
-                    "planning",
-                    f"💭 {self._state.latest_reasoning} [conf={self._state.latest_confidence:.2f}]",
-                    "info",
+                # ── Skill Retrieval Layer ─────────────────────────────────────
+                skill_executed = False
+                skills = self._memory_layer.retrieve_similar_skills(
+                    goal=subgoal.title,
+                    current_domain=self._state.current_url,
+                    top_k=1
                 )
+                if skills:
+                    top_skill, score = skills[0]
+                    # Only execute if highly confident
+                    if score > 0.8:
+                        self._emit("planning", f"🧠 Semantic Memory Match: {top_skill.name} (score {score:.2f})", "info")
+                        success, reason = self._skill_executor.execute_skill(top_skill)
+                        if success:
+                            self._emit("success", f"✅ Autonomous Skill executed successfully: {top_skill.name}", "success")
+                            self._state.latest_command = "task_complete"
+                            skill_executed = True
+                        else:
+                            self._emit("warning", f"⚠️ Skill execution failed: {reason}. Falling back to LLM.", "warning")
+                
+                if skill_executed:
+                    # Skip to Terminal Check
+                    frame.reasoning_latency_ms = int((time.perf_counter() - think_start) * 1000)
+                    pass # Handled below in Phase 3
+                else:
+                    # Ask Decider (Mistral) for the next action to accomplish the subgoal
+                    self._state.compressed_history = self._goal_planner.compress_roadmap(self._state.subgoals)
+                    
+                    if self._state.detect_stall():
+                        self._emit("warning", "⚠️ Loop stall warning: Agent is repeating identical steps without progress.", "warning")
+                    self._emit("planning", f"🧠 Reasoning how to complete subgoal: {subgoal.title}...", "info")
+
+                    action = self._decider.decide(self._state)
+                    frame.reasoning_latency_ms = int((time.perf_counter() - think_start) * 1000)
+
+                    # Process Structured Output Reliability Pipeline Telemetry & Events
+                    if action.get("was_repaired"):
+                        self._emit("json_repair", "🛠 Repaired malformed LLM JSON block.", "info")
+                        
+                    if action.get("has_warnings"):
+                        warnings = action.get("warnings", [])
+                        if "Complete JSON parse failure." in warnings:
+                            self._emit("malformed_output", "🧩 Complete parse failure! Safe fallback to observe.", "warning")
+                            self._state.consecutive_malformed += 1
+                            if self._state.consecutive_malformed >= 2:
+                                self._emit("warning", f"⚠️ Consecutive malformed outputs ({self._state.consecutive_malformed}). Clearing reasoning cache.", "warning")
+                                self._decider._cache.clear()
+                        else:
+                            for warn in warnings:
+                                self._emit("schema_warning", f"⚠️ Schema Warning: {warn}", "warning")
+                            self._state.consecutive_malformed = 0
+                    else:
+                        self._state.consecutive_malformed = 0
+
+                    self._state.latest_reasoning  = action.get("reasoning",  "")
+                    self._state.latest_confidence = action.get("confidence", 0.5)
+                    self._state.latest_command    = action.get("command",    "observe")
+                    self._state.latest_argument   = action.get("argument",   "")
+
+                    self._emit(
+                        "planning",
+                        f"💭 {self._state.latest_reasoning} [conf={self._state.latest_confidence:.2f}]",
+                        "info",
+                    )
 
             # ── Guard: low confidence ─────────────────────────────────────────
             if self._state.latest_confidence < CONFIDENCE_THRESHOLD:
@@ -324,9 +402,21 @@ class AgentLoopWorker(QObject):
             self._state.status = AgentStatus.ACTING
             cmd = self._state.latest_command
             arg = self._state.latest_argument
+            
+            # Detect primitive intents
+            primitives = ["youtube_search", "google_search", "play_video", "dismiss_overlay", "close_modal", "focus_searchbox"]
+            if cmd in primitives:
+                self._emit("primitive_detected", f"Primitive intent detected: {cmd}", "info")
+                self._emit("primitive_routed", f"Routing primitive: {cmd}({arg})", "info")
+                frame.primitive_used = True
+                frame.primitive_name = cmd
+                frame.execution_mode = "deterministic_primitive"
+            
             self._emit("action", f"⚡ Executing: {cmd}({arg})", "info")
 
+            exec_start = time.perf_counter()
             success = self._execute_action(cmd, arg)
+            frame.execution_latency_ms = int((time.perf_counter() - exec_start) * 1000)
             
             if getattr(self, "_transport_recovered", False):
                 # We crashed and recovered during the action phase. Do not record this action.
@@ -337,6 +427,51 @@ class AgentLoopWorker(QObject):
             if not success:
                 self._emit("retry", f"⚠️ Action failed ({self._state.consecutive_failures}/{MAX_CONSECUTIVE_FAILS})", "error")
             
+            # ════════════════════════════════════════════════════════════════════
+            # PHASE 5: VALIDATE & RECORD
+            # ════════════════════════════════════════════════════════════════════
+            val_start = time.perf_counter()
+            
+            page = self._browser_agent._page
+            if page and not page.is_closed():
+                # Take after snapshot & screenshot
+                after_snapshot = TransitionValidator.take_snapshot(page)
+                score, t_type = TransitionValidator.compute_transition_score(self._state.before_snapshot, after_snapshot)
+                
+                frame.after_screenshot_path = f"frame_{frame.iteration}_after.jpg"
+                full_after = os.path.join(self._recorder.screenshots_dir, frame.after_screenshot_path)
+                ExecutionRecorder.capture_and_compress_screenshot(page, full_after)
+                
+                # Compute visual diff
+                frame.diff_screenshot_path = f"frame_{frame.iteration}_diff.jpg"
+                full_diff = os.path.join(self._recorder.diffs_dir, frame.diff_screenshot_path)
+                full_before = os.path.join(self._recorder.screenshots_dir, frame.before_screenshot_path)
+                
+                ExecutionRecorder.compute_visual_diff(full_before, full_after, full_diff)
+                
+                frame.after_state = {
+                    "url": after_snapshot.url,
+                    "title": after_snapshot.title,
+                    "active_element": after_snapshot.active_element,
+                    "modal_state": after_snapshot.modal_state
+                }
+                
+                # Populate frame validation
+                frame.transition_score = score
+                frame.transition_type = t_type
+            
+            # Populate frame action info
+            frame.command = cmd
+            frame.argument = arg
+            frame.confidence = self._state.latest_confidence
+            frame.reasoning = self._state.latest_reasoning
+            frame.action_success = success
+            
+            frame.validation_latency_ms = int((time.perf_counter() - val_start) * 1000)
+            
+            # Commit frame to disk
+            self._recorder.record_frame(frame)
+
             # Throttle between iterations to behave human-like
             time.sleep(ACTION_DELAY_SEC)
 

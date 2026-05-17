@@ -26,4 +26,8 @@ screenshots/
 
 # ── Local DBs & temp dirs ─────────────────────────────────────────────────────
 workflows.db
+workflows.db-journal
 tmp/
+sessions/
+skills/
+*.jsonl

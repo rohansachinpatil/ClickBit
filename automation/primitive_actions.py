@@ -10,6 +10,7 @@ from playwright.sync_api import Page
 from utils.logger import get_logger
 from automation.ui_state_engine import UIStateEngine
 from agent.transition_validator import TransitionValidator
+from automation.js_bridge import safe_evaluate
 
 logger = get_logger(__name__)
 
@@ -27,24 +28,79 @@ class PrimitiveActions:
             if "youtube.com" not in page.url:
                 page.goto("https://youtube.com", timeout=12000, wait_until="load")
                 
-            # 1. Fallback selectors for YouTube search field
-            selectors = ["input#search", "ytd-searchbox input", 'input[name="search_query"]', 'input[placeholder*="Search" i]']
-            target_sel = None
-            for sel in selectors:
+            # Resilient Searchbox Resolution Cascade
+            loc = None
+            
+            # A. Try CSS selectors
+            css_selectors = ["input#search", "ytd-searchbox input", 'input[name="search_query"]', 'input[placeholder*="Search" i]']
+            for sel in css_selectors:
                 try:
-                    loc = page.locator(sel).first
-                    if loc.count() > 0 and loc.is_visible():
-                        target_sel = sel
+                    candidate = page.locator(sel).first
+                    if candidate.count() > 0 and candidate.is_visible():
+                        loc = candidate
+                        logger.info(f"[PrimitiveActions] youtube_search resolved searchbox via CSS locator: '{sel}'")
                         break
                 except Exception:
                     pass
+
+            # B. Try get_by_role fallback
+            if not loc:
+                try:
+                    candidate = page.get_by_role("textbox", name="Search", exact=False).first
+                    if candidate.count() > 0 and candidate.is_visible():
+                        loc = candidate
+                        logger.info("[PrimitiveActions] youtube_search resolved searchbox via get_by_role('textbox')")
+                except Exception:
+                    pass
                     
-            if not target_sel:
-                # 2. Role locator fallback
-                target_sel = 'role=textbox[name="Search" i]'
-                
-            logger.info(f"[PrimitiveActions] YouTube target resolved to '{target_sel}'. Typing query...")
-            loc = page.locator(target_sel).first
+            if not loc:
+                try:
+                    candidate = page.get_by_role("combobox", name="Search", exact=False).first
+                    if candidate.count() > 0 and candidate.is_visible():
+                        loc = candidate
+                        logger.info("[PrimitiveActions] youtube_search resolved searchbox via get_by_role('combobox')")
+                except Exception:
+                    pass
+
+            # C. Try get_by_placeholder fallback
+            if not loc:
+                try:
+                    candidate = page.get_by_placeholder("Search", exact=False).first
+                    if candidate.count() > 0 and candidate.is_visible():
+                        loc = candidate
+                        logger.info("[PrimitiveActions] youtube_search resolved searchbox via get_by_placeholder")
+                except Exception:
+                    pass
+
+            # D. Evaluate JS fallback
+            if not loc:
+                try:
+                    logger.warning("[PrimitiveActions] Locator strategies failed. Executing fallback evaluate selector lookup...")
+                    sel = safe_evaluate(page, """() => {
+                        const input = document.querySelector('input#search, ytd-searchbox input, input[name="search_query"], input[placeholder*="Search" i]');
+                        if (input) {
+                            return 'input#search'; // standard identifier
+                        }
+                        const inputs = Array.from(document.querySelectorAll('input, textarea'));
+                        for (const i of inputs) {
+                            const p = (i.placeholder || "").toLowerCase();
+                            const n = (i.name || "").toLowerCase();
+                            const id = (i.id || "").toLowerCase();
+                            if (p.includes("search") || n.includes("search") || id.includes("search")) {
+                                return i.id ? '#' + i.id : 'input[name="' + i.name + '"]';
+                            }
+                        }
+                        return null;
+                    }""")
+                    if sel:
+                        loc = page.locator(sel).first
+                        logger.info(f"[PrimitiveActions] youtube_search resolved searchbox via fallback evaluate: '{sel}'")
+                except Exception as e:
+                    logger.error(f"[PrimitiveActions] Fallback evaluate failed: {e}")
+
+            if not loc:
+                raise ValueError("Could not resolve YouTube searchbox using any strategy.")
+
             loc.click(timeout=5000)
             
             # Resilient clear and input sequence
@@ -373,7 +429,7 @@ class PrimitiveActions:
             score = TransitionValidator.compute_transition_score(snap_before, snap_after)
             duration_ms = int((time.perf_counter() - start_time) * 1000)
 
-            success = score >= 0.10 or page.evaluate("document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA'")
+            success = score >= 0.10 or safe_evaluate(page, "() => document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA'")
 
             telemetry = {
                 "event_type": "primitive_executed",

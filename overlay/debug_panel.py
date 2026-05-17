@@ -8,11 +8,12 @@ Derives layout styles, border highlights, and status orb glows from centralized 
 
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QFrame, QPushButton, QListWidget, QListWidgetItem,
-                             QProgressBar)
+                             QProgressBar, QTabWidget)
 from PyQt5.QtCore import Qt, pyqtSlot, QDateTime, pyqtSignal, QSize
 from PyQt5.QtGui import QColor, QFont, QCursor, QPixmap
 from ui.theme import Colors, UIState, Typography, Spacing, Effects, get_svg_pixmap, get_svg_icon, CI_MODE
 from ui.components import GlassCard, StatusOrb, IconButton, AnimatedChip
+from overlay.replay_panel import ReplayPanel
 
 def clean_emoji_prefixes(msg: str) -> str:
     """Strips any legacy emoji prefixes from messages to ensure professional styling."""
@@ -215,8 +216,93 @@ class DebugPanel(QWidget):
         
         inner_layout.addLayout(header)
 
+        # ── Setup Tabs ─────────────────────────────────────────────────────────
+        self.tabs = QTabWidget(self.container)
+        self.tabs.setStyleSheet(f"""
+            QTabWidget::pane {{
+                border: none;
+                background: transparent;
+            }}
+            QTabBar::tab {{
+                background: transparent;
+                color: {Colors.TEXT_SECONDARY};
+                font-family: {Typography.FAMILY};
+                font-size: 11px;
+                font-weight: 600;
+                padding: 4px 12px;
+                margin-right: 4px;
+                border-radius: 6px;
+            }}
+            QTabBar::tab:selected {{
+                background: rgba(255, 255, 255, 0.1);
+                color: {Colors.TEXT_PRIMARY};
+            }}
+        """)
+        inner_layout.addWidget(self.tabs, 1)
+
+        # ── RUN TAB ────────────────────────────────────────────────────────────
+        self.run_tab = QWidget()
+        run_layout = QVBoxLayout(self.run_tab)
+        run_layout.setContentsMargins(0, Spacing.SM, 0, 0)
+        run_layout.setSpacing(Spacing.SM)
+        self.tabs.addTab(self.run_tab, "Run")
+
+        # ── REPLAY TAB ─────────────────────────────────────────────────────────
+        self.replay_panel = ReplayPanel()
+        self.tabs.addTab(self.replay_panel, "Replay")
+
+        # ── SKILLS TAB ─────────────────────────────────────────────────────────
+        self.skills_tab = QWidget()
+        skills_layout = QVBoxLayout(self.skills_tab)
+        skills_layout.setContentsMargins(0, Spacing.SM, 0, 0)
+        skills_layout.setSpacing(Spacing.SM)
+        self.tabs.addTab(self.skills_tab, "Skills")
+
+        self.skills_list = QListWidget()
+        self.skills_list.setStyleSheet(f"""
+            QListWidget {{
+                background: rgba(0, 0, 0, 0.03);
+                border: 1px solid {Colors.BORDER_LIGHT};
+                border-radius: 10px;
+                padding: 4px;
+                outline: none;
+                color: {Colors.TEXT_PRIMARY};
+                font-family: {Typography.FAMILY};
+                font-size: 11px;
+            }}
+            QScrollBar:vertical {{
+                border: none;
+                background: transparent;
+                width: 6px;
+                margin: 0;
+            }}
+            QScrollBar::handle:vertical {{
+                background: rgba(0, 0, 0, 0.12);
+                min-height: 20px;
+                border-radius: 3px;
+            }}
+            QListWidget::item {{
+                border-bottom: 1px solid rgba(0, 0, 0, 0.04);
+                padding: 6px 4px;
+            }}
+        """)
+        skills_layout.addWidget(self.skills_list, 1)
+
+        refresh_skills_btn = QPushButton("Refresh Skills")
+        refresh_skills_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: rgba(255, 255, 255, 0.1);
+                color: {Colors.TEXT_PRIMARY};
+                border: 1px solid {Colors.BORDER_LIGHT};
+                border-radius: 6px;
+                padding: 6px;
+            }}
+        """)
+        refresh_skills_btn.clicked.connect(self.refresh_skills)
+        skills_layout.addWidget(refresh_skills_btn)
+
         # 3. Pinned Live State Card (Sub-surface Glass)
-        self._state_card = GlassCard(self.container, rounded_radius=10, border_color=Colors.BORDER_LIGHT)
+        self._state_card = GlassCard(self.run_tab, rounded_radius=10, border_color=Colors.BORDER_LIGHT)
         state_layout = QVBoxLayout(self._state_card)
         state_layout.setSpacing(Spacing.SM)
         state_layout.setContentsMargins(Spacing.MD, Spacing.MD, Spacing.MD, Spacing.MD)
@@ -346,10 +432,10 @@ class DebugPanel(QWidget):
         conf_row.addWidget(self._conf_pct)
         state_layout.addLayout(conf_row)
 
-        inner_layout.addWidget(self._state_card)
+        run_layout.addWidget(self._state_card)
 
         # 4. Intervention Card (hidden by default)
-        self._intervention_card = GlassCard(self.container, rounded_radius=10, border_color=Colors.RED)
+        self._intervention_card = GlassCard(self.run_tab, rounded_radius=10, border_color=Colors.RED)
         self._intervention_card.hide()
         inter_layout = QVBoxLayout(self._intervention_card)
         inter_layout.setSpacing(Spacing.SM)
@@ -436,7 +522,7 @@ class DebugPanel(QWidget):
         btn_row.addWidget(self._abort_btn, 1)
         inter_layout.addLayout(btn_row)
         
-        inner_layout.addWidget(self._intervention_card)
+        run_layout.addWidget(self._intervention_card)
         
         self._resume_btn.clicked.connect(self.resumeClicked.emit)
         self._resume_btn.clicked.connect(self._intervention_card.hide)
@@ -456,7 +542,7 @@ class DebugPanel(QWidget):
                 margin-top: 4px;
             }}
         """)
-        inner_layout.addWidget(feed_label)
+        run_layout.addWidget(feed_label)
 
         self.event_list = QListWidget()
         self.event_list.setStyleSheet(f"""
@@ -489,7 +575,7 @@ class DebugPanel(QWidget):
                 background: transparent;
             }}
         """)
-        inner_layout.addWidget(self.event_list, 1)
+        run_layout.addWidget(self.event_list, 1)
 
         # 6. Footer Layout
         footer = QHBoxLayout()
@@ -656,3 +742,23 @@ class DebugPanel(QWidget):
     def mouseMoveEvent(self, event):
         if event.buttons() == Qt.LeftButton and self._drag_start:
             self.move(event.globalPos() - self._drag_start)
+
+    def refresh_skills(self):
+        self.skills_list.clear()
+        import json, os
+        index_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "skills", "index.json")
+        try:
+            if not os.path.exists(index_path):
+                self.skills_list.addItem("No skills found.")
+                return
+            with open(index_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                skills = data.get("skills", [])
+                for s in skills:
+                    name = s.get("name", "Unknown")
+                    domain = s.get("domain", "global")
+                    score = s.get("success_rate", 0.0) * 100
+                    status = "🚫 Quarantined" if s.get("quarantined", False) else f"✅ {score:.0f}%"
+                    self.skills_list.addItem(f"[{domain}] {name}\n   Status: {status}")
+        except Exception as e:
+            self.skills_list.addItem(f"Failed to load skills: {e}")

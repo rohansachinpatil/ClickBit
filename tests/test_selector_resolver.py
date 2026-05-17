@@ -1,8 +1,27 @@
+import sys
+from unittest.mock import MagicMock
+
+try:
+    import PyQt5
+except ImportError:
+    sys.modules['PyQt5'] = MagicMock()
+    sys.modules['PyQt5.QtCore'] = MagicMock()
+    sys.modules['PyQt5.QtWidgets'] = MagicMock()
+    sys.modules['PyQt5.QtGui'] = MagicMock()
+
+try:
+    import playwright
+except ImportError:
+    sys.modules['playwright'] = MagicMock()
+    sys.modules['playwright.sync_api'] = MagicMock()
+
 import pytest
 import os
 import shutil
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 from automation.selector_resolver import SelectorResolver, CandidateElement
+import automation.element_classifier
+import automation.ui_state_engine
 
 @pytest.fixture
 def temp_db():
@@ -178,3 +197,50 @@ def test_execute_fallback_chain_missing_action_type():
     with pytest.raises(ResolverExecutionError) as exc_info:
         resolver.execute_fallback_chain(mock_page, primary, "Search")
     assert "action_type is missing or empty" in str(exc_info.value)
+
+def test_resolver_evaluate_bridge():
+    resolver = SelectorResolver(db_path="tmp/test_eval_bridge.db")
+    mock_page = MagicMock()
+    mock_page.url = "http://google.com"
+    
+    # Mock gather_candidates candidates list
+    candidates = []
+    
+    with patch("automation.selector_resolver.safe_evaluate") as mock_safe_eval:
+        mock_safe_eval.return_value = []
+        resolver.gather_candidates(mock_page)
+        
+        # Verify gather_candidates correctly routed to safe_evaluate
+        assert mock_safe_eval.called
+        
+    # Test pointer interception detection triggers safe_evaluate calls
+    mock_locator = MagicMock()
+    mock_locator.is_visible.return_value = True
+    mock_locator.is_enabled.return_value = True
+    mock_locator.bounding_box.return_value = {"x": 10, "y": 20, "width": 100, "height": 50}
+    mock_page.locator.return_value.first = mock_locator
+    
+    with patch("automation.selector_resolver.safe_evaluate") as mock_safe_eval, \
+         patch("automation.element_classifier.ElementClassifier.classify") as mock_classify, \
+         patch("automation.ui_state_engine.UIStateEngine.inspect_page") as mock_inspect:
+         
+        # Mock classifer and ui state
+        from automation.element_classifier import ElementType
+        mock_classify.return_value = ElementType.BUTTON
+        mock_inspect.return_value.pointer_blocked = False
+        
+        # accessible return value
+        mock_safe_eval.return_value = True
+        
+        resolver._perform_action(mock_page, "button#test", "click", "")
+        
+        # Verify safe_evaluate was called with the correct payload structure
+        # The first call should be is_accessible check: {"sel": selector, "x": cx, "y": cy}
+        assert mock_safe_eval.call_count >= 1
+        first_call_args = mock_safe_eval.call_args_list[0][0]
+        assert first_call_args[0] == mock_page
+        payload = first_call_args[2]
+        assert payload["sel"] == "button#test"
+        assert payload["x"] == 60 # 10 + 100/2
+        assert payload["y"] == 45 # 20 + 50/2
+

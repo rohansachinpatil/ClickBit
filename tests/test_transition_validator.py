@@ -53,42 +53,42 @@ def test_compute_transition_score_no_change():
     snap_before = TransitionSnapshot("https://example.com", "Title", "INPUT", "hash1", "hash2", False)
     snap_after = TransitionSnapshot("https://example.com", "Title", "INPUT", "hash1", "hash2", False)
     
-    score = TransitionValidator.compute_transition_score(snap_before, snap_after)
+    score, _ = TransitionValidator.compute_transition_score(snap_before, snap_after)
     assert score == 0.0
 
 def test_compute_transition_score_url_change():
     snap_before = TransitionSnapshot("https://example.com", "Title", "INPUT", "hash1", "hash2", False)
     snap_after = TransitionSnapshot("https://example.com/new", "Title", "INPUT", "hash1", "hash2", False)
     
-    score = TransitionValidator.compute_transition_score(snap_before, snap_after)
+    score, _ = TransitionValidator.compute_transition_score(snap_before, snap_after)
     assert score == 0.8
 
 def test_compute_transition_score_title_change():
     snap_before = TransitionSnapshot("https://example.com", "Title 1", "INPUT", "hash1", "hash2", False)
     snap_after = TransitionSnapshot("https://example.com", "Title 2", "INPUT", "hash1", "hash2", False)
     
-    score = TransitionValidator.compute_transition_score(snap_before, snap_after)
+    score, _ = TransitionValidator.compute_transition_score(snap_before, snap_after)
     assert score == 0.4
 
 def test_compute_transition_score_text_change():
     snap_before = TransitionSnapshot("https://example.com", "Title", "INPUT", "hash1", "hash2", False)
     snap_after = TransitionSnapshot("https://example.com", "Title", "INPUT", "hash3", "hash2", False)
     
-    score = TransitionValidator.compute_transition_score(snap_before, snap_after)
+    score, _ = TransitionValidator.compute_transition_score(snap_before, snap_after)
     assert score == 0.3
 
 def test_compute_transition_score_elements_change():
     snap_before = TransitionSnapshot("https://example.com", "Title", "INPUT", "hash1", "hash2", False)
     snap_after = TransitionSnapshot("https://example.com", "Title", "INPUT", "hash1", "hash4", False)
     
-    score = TransitionValidator.compute_transition_score(snap_before, snap_after)
+    score, _ = TransitionValidator.compute_transition_score(snap_before, snap_after)
     assert score == 0.3
 
 def test_compute_transition_score_modal_change():
     snap_before = TransitionSnapshot("https://example.com", "Title", "INPUT", "hash1", "hash2", False)
     snap_after = TransitionSnapshot("https://example.com", "Title", "INPUT", "hash1", "hash2", True)
     
-    score = TransitionValidator.compute_transition_score(snap_before, snap_after)
+    score, _ = TransitionValidator.compute_transition_score(snap_before, snap_after)
     assert score == 0.4
 
 def test_compute_transition_score_multiple_changes_capped():
@@ -96,5 +96,5 @@ def test_compute_transition_score_multiple_changes_capped():
     snap_before = TransitionSnapshot("https://example.com", "Title 1", "INPUT", "hash1", "hash2", False)
     snap_after = TransitionSnapshot("https://example.com/new", "Title 2", "INPUT", "hash3", "hash2", False)
     
-    score = TransitionValidator.compute_transition_score(snap_before, snap_after)
+    score, _ = TransitionValidator.compute_transition_score(snap_before, snap_after)
     assert score == 1.0

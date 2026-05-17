@@ -9,6 +9,7 @@ import hashlib
 import time
 from playwright.sync_api import Page
 from utils.logger import get_logger
+from automation.js_bridge import safe_evaluate
 
 logger = get_logger(__name__)
 
@@ -77,7 +78,7 @@ class TransitionValidator:
                 };
             }
             """
-            data = page.evaluate(js_script)
+            data = safe_evaluate(page, js_script)
             
             # Lightweight MD5 hashing for rapid comparison
             text_hash = hashlib.md5(data["visible_text"].encode("utf-8", errors="ignore")).hexdigest()
@@ -99,35 +100,50 @@ class TransitionValidator:
             return TransitionSnapshot("", "", "", "", "", False)
 
     @staticmethod
-    def compute_transition_score(before: TransitionSnapshot, after: TransitionSnapshot) -> float:
+    def compute_transition_score(before: TransitionSnapshot, after: TransitionSnapshot) -> tuple[float, str]:
         """
-        Computes the delta magnitude between two snapshots, returning a score from 0.0 to 1.0.
+        Computes the delta magnitude between two snapshots, returning a score from 0.0 to 1.0,
+        and a specific transition_type string.
         A score >= 0.15 indicates a successful, meaningful state transition.
         """
         score = 0.0
+        transition_type = "no_change"
         
         # 1. URL change is a highly significant transition
         if before.url != after.url:
             score += 0.8
+            transition_type = "navigation"
+            if "youtube.com/watch" in after.url and "youtube.com/watch" not in before.url:
+                transition_type = "playback_started"
             
         # 2. Page Title change is highly meaningful
         if before.title != after.title:
             score += 0.4
+            if transition_type == "no_change":
+                transition_type = "navigation"
             
-        # 3. DOM Text structural mutation
+        # 3. Modal / Overlay visibility state change
+        if before.modal_state != after.modal_state:
+            score += 0.4
+            if after.modal_state:
+                transition_type = "modal_open"
+            else:
+                transition_type = "modal_close"
+                
+        # 4. DOM Text structural mutation
         if before.text_hash != after.text_hash:
             score += 0.3
-            
-        # 4. Clickable structures layout mutation
+            if transition_type == "no_change":
+                transition_type = "scroll" # Often a scroll or dynamic content load
+                
+        # 5. Clickable structures layout mutation
         if before.elements_hash != after.elements_hash:
             score += 0.3
             
-        # 5. Focus pointer movement
+        # 6. Focus pointer movement
         if before.active_element != after.active_element:
             score += 0.2
-            
-        # 6. Modal / Overlay visibility state change
-        if before.modal_state != after.modal_state:
-            score += 0.4
-            
-        return min(1.0, score)
+            if transition_type == "no_change":
+                transition_type = "input_change"
+                
+        return min(1.0, score), transition_type

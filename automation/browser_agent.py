@@ -36,6 +36,7 @@ MAX_RETRIES = 3
 from automation.observer import Observer, BrowserObservation
 from automation.selector_resolver import SelectorResolver, ResolverExecutionError
 from ui.theme import CI_MODE
+from automation.js_bridge import safe_evaluate
 
 class BrowserSessionState(Enum):
     DEAD = "dead"
@@ -535,9 +536,7 @@ class BrowserAgent(QObject):
 
     def _type_text(self, text: str):
         # Check if active element is an input
-        is_input_active = self._page.evaluate(
-            "document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA'"
-        )
+        is_input_active = safe_evaluate(self._page, "() => document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA'")
         if is_input_active:
             self._page.keyboard.type(text)
             return

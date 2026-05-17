@@ -7,6 +7,7 @@ and pointer blockage detection. Exposes page interaction state snapshots.
 
 from playwright.sync_api import Page
 from utils.logger import get_logger
+from automation.js_bridge import safe_evaluate
 
 logger = get_logger(__name__)
 
@@ -176,7 +177,7 @@ class UIStateEngine:
                 };
             }
             """
-            data = page.evaluate(js_script)
+            data = safe_evaluate(page, js_script)
             return UIState(
                 overlay_open=data.get("overlay_open", False),
                 modal_visible=data.get("modal_visible", False),
@@ -276,11 +277,11 @@ class UIStateEngine:
                 # If element is inside the overlay itself, it is safe to interact with!
                 # We check if the element is nested under the blocker selector.
                 try:
-                    is_nested = page.evaluate(f"""(sel, blocker) => {{
-                        const el = document.querySelector(sel);
-                        const bl = document.querySelector(blocker);
+                    is_nested = safe_evaluate(page, """args => {
+                        const el = document.querySelector(args.sel);
+                        const bl = document.querySelector(args.blocker);
                         return bl && el && (bl === el || bl.contains(el));
-                    }}""", selector, state.blocker_selector)
+                    }""", {"sel": selector, "blocker": state.blocker_selector})
                     if is_nested:
                         return True
                 except Exception:

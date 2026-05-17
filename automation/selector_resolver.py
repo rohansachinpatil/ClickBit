@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional, Tuple
 from utils.logger import get_logger
+from automation.js_bridge import safe_evaluate
 
 logger = get_logger(__name__)
 
@@ -196,7 +197,7 @@ class SelectorResolver:
         }
         """
         try:
-            raw_nodes = page.evaluate(js_script)
+            raw_nodes = safe_evaluate(page, js_script)
             candidates = []
             for node in raw_nodes:
                 candidates.append(CandidateElement(
@@ -545,21 +546,21 @@ class SelectorResolver:
             cx = rect["x"] + rect["width"] / 2
             cy = rect["y"] + rect["height"] / 2
             
-            is_accessible = page.evaluate("""(sel, x, y) => {
-                const target = document.querySelector(sel);
+            is_accessible = safe_evaluate(page, """args => {
+                const target = document.querySelector(args.sel);
                 if (!target) return false;
-                const topEl = document.elementFromPoint(x, y);
+                const topEl = document.elementFromPoint(args.x, args.y);
                 if (!topEl) return true; // fallback
                 return target === topEl || target.contains(topEl) || topEl.contains(target);
-            }""", selector, cx, cy)
+            }""", {"sel": selector, "x": cx, "y": cy})
             
             if not is_accessible:
-                blocker_info = page.evaluate("""(x, y) => {
-                    const el = document.elementFromPoint(x, y);
+                blocker_info = safe_evaluate(page, """args => {
+                    const el = document.elementFromPoint(args.x, args.y);
                     if (!el) return "unknown";
                     return el.tagName + (el.id ? '#' + el.id : '') + 
                            (el.className ? '.' + el.className.split(' ').join('.') : '');
-                }""", cx, cy)
+                }""", {"x": cx, "y": cy})
                 raise ResolverExecutionError(
                     f"Target element '{selector}' is pointer-blocked / intercepted by overlay element: '{blocker_info}' at ({cx:.1f}, {cy:.1f})."
                 )
@@ -568,11 +569,11 @@ class SelectorResolver:
         ui_state = UIStateEngine.inspect_page(page)
         if ui_state.pointer_blocked and ui_state.blocker_selector:
             try:
-                is_nested = page.evaluate(f"""(sel, blocker) => {{
-                    const el = document.querySelector(sel);
-                    const bl = document.querySelector(blocker);
+                is_nested = safe_evaluate(page, """args => {
+                    const el = document.querySelector(args.sel);
+                    const bl = document.querySelector(args.blocker);
                     return bl && el && (bl === el || bl.contains(el));
-                }}""", selector, ui_state.blocker_selector)
+                }""", {"sel": selector, "blocker": ui_state.blocker_selector})
                 if not is_nested:
                     raise ResolverExecutionError(f"Target element '{selector}' is blocked/obscured by overlay '{ui_state.blocker_selector}'.")
             except Exception as e:
@@ -593,13 +594,13 @@ class SelectorResolver:
         # Click safety verification
         elif action_type in ("click", "click_text", "click_index", "click_first_result"):
             is_clickable = classification in (ElementType.BUTTON, ElementType.LINK, ElementType.SEARCHBOX, ElementType.MENU) or \
-                           page.evaluate("""sel => {
-                               const el = document.querySelector(sel);
+                           safe_evaluate(page, """args => {
+                               const el = document.querySelector(args.sel);
                                if (!el) return false;
                                const tag = el.tagName.toLowerCase();
                                const role = el.getAttribute('role') || '';
                                return tag === 'button' || tag === 'a' || tag === 'input' || role === 'button' || role === 'link' || el.onclick != null;
-                           }""", selector)
+                           }""", {"sel": selector})
             if not is_clickable:
                 logger.warning(f"Element '{selector}' classification is {classification.value}, which is not standard clickable. Attempting interaction anyway.")
             locator.click(timeout=5000)
