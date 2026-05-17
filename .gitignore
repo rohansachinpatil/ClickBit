@@ -23,3 +23,7 @@ screenshots/
 .idea/
 *.sublime-project
 *.sublime-workspace
+
+# ── Local DBs & temp dirs ─────────────────────────────────────────────────────
+workflows.db
+tmp/

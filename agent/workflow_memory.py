@@ -8,7 +8,7 @@ Allows instant recall of repeated tasks.
 import sqlite3
 import json
 import os
-import numpy as np
+import struct
 from datetime import datetime
 from utils.logger import get_logger
 from agent.semantic_memory import SemanticMemoryEngine
@@ -90,12 +90,18 @@ class WorkflowMemory:
             highest_score = -1.0
             
             for db_prompt, db_plan, db_embedding_blob in rows:
-                db_vec = np.frombuffer(db_embedding_blob, dtype=np.float32)
-                score = self.semantic_engine.calculate_similarity(query_vec, db_vec)
-                
-                if score > highest_score:
-                    highest_score = score
-                    best_match = (db_prompt, db_plan)
+                if not db_embedding_blob:
+                    continue
+                try:
+                    num_floats = len(db_embedding_blob) // 4
+                    db_vec = list(struct.unpack(f"{num_floats}f", db_embedding_blob))
+                    score = self.semantic_engine.calculate_similarity(query_vec, db_vec)
+                    
+                    if score > highest_score:
+                        highest_score = score
+                        best_match = (db_prompt, db_plan)
+                except Exception as ex:
+                    logger.warning(f"Failed to unpack embedding for prompt '{db_prompt}': {ex}")
             
             if highest_score >= SIMILARITY_THRESHOLD and best_match:
                 logger.info(f"Semantic Memory HIT: '{clean_prompt}' matches '{best_match[0]}' (Score: {highest_score:.2f})")
@@ -107,8 +113,6 @@ class WorkflowMemory:
         except Exception as e:
             logger.error(f"Error reading from semantic memory: {e}")
 
-        return None
-
     def save_workflow(self, prompt: str, plan: dict, success: bool = True):
         """Saves a successful workflow to the database."""
         if not success:
@@ -119,7 +123,8 @@ class WorkflowMemory:
         
         try:
             embedding = self.semantic_engine.encode(clean_prompt)
-            embedding_blob = embedding.astype(np.float32).tobytes()
+            # Pack list of floats to binary bytes (each 'f' is 4 bytes float)
+            embedding_blob = struct.pack(f"{len(embedding)}f", *embedding)
             
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()

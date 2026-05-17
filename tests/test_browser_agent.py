@@ -37,21 +37,51 @@ def test_retry_wrapper_success(mock_playwright):
                 assert success is True
                 assert mock_click.call_count == 2
 
-def test_recovery_system_epipe(mock_playwright):
+from playwright.sync_api import Error as PlaywrightError
+from automation.browser_agent import BrowserSessionState, TransportError
+import threading
+
+def test_transport_recovery_epipe(mock_playwright):
     agent = BrowserAgent(headless=True)
     
-    # Inject the mock Playwright components so the agent believes it has a running session
+    # Inject the mock Playwright components
     agent._playwright = mock_playwright["playwright"]
     agent._browser = mock_playwright["browser"]
+    agent._page = mock_playwright["page"]
+    agent._session_state = BrowserSessionState.READY
     
-    # Simulate an EPIPE disconnect by making is_connected return False
+    # Simulate an EPIPE disconnect
     mock_playwright["browser"].is_connected.return_value = False
     
-    # We patch _teardown_browser and _ensure_browser to verify they are called during recovery
-    with patch.object(agent, '_teardown_browser') as mock_teardown, \
+    with patch.object(agent, '_safe_teardown') as mock_teardown, \
          patch.object(agent, '_ensure_browser') as mock_ensure:
          
-        agent._recover_state()
-        
+        with pytest.raises(TransportError):
+            agent.execute_single_action("observe", "")
+            
         mock_teardown.assert_called_once()
         mock_ensure.assert_called_once()
+        assert agent._session_state == BrowserSessionState.READY
+        assert agent._session_generation == 1
+
+def test_safe_teardown_concurrency():
+    agent = BrowserAgent(headless=True)
+    agent._session_state = BrowserSessionState.READY
+    
+    def teardown_worker():
+        agent._safe_teardown()
+
+    threads = [threading.Thread(target=teardown_worker) for _ in range(5)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+
+    # The state should be DEAD and no exceptions should have escaped
+    assert agent._session_state == BrowserSessionState.DEAD
+
+def test_emergency_stop_lifecycle():
+    agent = BrowserAgent(headless=True)
+    agent._session_state = BrowserSessionState.READY
+    
+    agent.close()
+    
+    assert agent._session_state == BrowserSessionState.DEAD

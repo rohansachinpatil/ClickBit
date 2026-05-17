@@ -35,6 +35,5 @@ pytest-qt>=4.0.0
 pytest-mock>=3.0.0
 coverage>=7.0.0
 
-# Semantic Memory
-numpy>=1.26.0
-sentence-transformers>=3.0.0
+# Semantic Memory (uses built-in standard libraries & Mistral API)
+httpx>=0.27.0

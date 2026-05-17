@@ -7,12 +7,18 @@ logger = get_logger(__name__)
 
 class BrowserObservation:
     """Structured representation of the page state."""
-    def __init__(self, title: str, buttons: list[str], inputs: list[str], links: list[str], text_blocks: list[str]):
+    def __init__(self, title: str, buttons: list[str], inputs: list[str], links: list[str], text_blocks: list[str],
+                 captcha_detected: bool = False, auth_required: bool = False, permission_popup: bool = False, modal_blocking_flow: bool = False, intervention_reason: str = None):
         self.title = title
         self.buttons = buttons
         self.inputs = inputs
         self.links = links
         self.text_blocks = text_blocks
+        self.captcha_detected = captcha_detected
+        self.auth_required = auth_required
+        self.permission_popup = permission_popup
+        self.modal_blocking_flow = modal_blocking_flow
+        self.intervention_reason = intervention_reason
 
     def to_dict(self):
         return {
@@ -20,7 +26,12 @@ class BrowserObservation:
             "buttons": self.buttons[:15],
             "inputs": self.inputs[:15],
             "links": self.links[:15],
-            "visible_text": self.text_blocks[:5]
+            "visible_text": self.text_blocks[:5],
+            "captcha_detected": self.captcha_detected,
+            "auth_required": self.auth_required,
+            "permission_popup": self.permission_popup,
+            "modal_blocking_flow": self.modal_blocking_flow,
+            "intervention_reason": self.intervention_reason
         }
 
 class Observer:
@@ -68,12 +79,35 @@ class Observer:
                     .map(el => el.innerText.trim())
                     .filter(t => t.length > 0);
                     
+                // Heuristics for human intervention
+                let captcha_detected = false;
+                let auth_required = false;
+                let permission_popup = false;
+                let modal_blocking_flow = false;
+                let intervention_reason = null;
+
+                if (document.querySelector('iframe[src*="recaptcha"]') || document.querySelector('iframe[src*="cloudflare"]') || document.querySelector('.cf-turnstile') || document.body.innerText.includes('Verify you are human')) {
+                    captcha_detected = true;
+                    intervention_reason = 'CAPTCHA_DETECTED';
+                } else if (document.querySelector('input[type="password"]')) {
+                    auth_required = true;
+                    intervention_reason = 'AUTH_REQUIRED';
+                } else if (document.querySelector('div[id*="cookie"]') || document.querySelector('div[role="dialog"]')) {
+                    modal_blocking_flow = true;
+                    intervention_reason = 'MODAL_BLOCKING_FLOW';
+                }
+                    
                 return {
                     title: document.title,
                     buttons: [...new Set(buttons)],
                     inputs: [...new Set(inputs)],
                     links: [...new Set(links)],
-                    text_blocks: [...new Set(text_blocks)]
+                    text_blocks: [...new Set(text_blocks)],
+                    captcha_detected: captcha_detected,
+                    auth_required: auth_required,
+                    permission_popup: permission_popup,
+                    modal_blocking_flow: modal_blocking_flow,
+                    intervention_reason: intervention_reason
                 };
             }
             """
@@ -84,7 +118,12 @@ class Observer:
                 buttons=data.get("buttons", []),
                 inputs=data.get("inputs", []),
                 links=data.get("links", []),
-                text_blocks=data.get("text_blocks", [])
+                text_blocks=data.get("text_blocks", []),
+                captcha_detected=data.get("captcha_detected", False),
+                auth_required=data.get("auth_required", False),
+                permission_popup=data.get("permission_popup", False),
+                modal_blocking_flow=data.get("modal_blocking_flow", False),
+                intervention_reason=data.get("intervention_reason", None)
             )
             
         except Exception as e:

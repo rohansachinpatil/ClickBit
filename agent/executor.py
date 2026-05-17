@@ -1,266 +1,192 @@
 """
 agent/executor.py
 ------------------
-[BEGINNER GUIDE]
-What is this file?
-This is the "Brain Stem" of ClickBit. It connects all the pieces together.
-When you type a command, the UI sends it here. This file then:
-  1. Asks the Planner (AI) for a plan.
-  2. Shows you the plan to get your approval.
-  3. Sends the approved plan to the BrowserAgent (the Hands) to actually click buttons.
+The central coordinator between the UI, the Autonomous Agent Loop,
+and the BrowserAgent.
 
-Why is this file so big?
-Because it handles "Threads". If we did all the heavy AI thinking and web browsing
-on the main thread, the app would freeze and stop responding to your clicks.
-So, the Executor creates "Worker Threads" that run in the background.
+Architecture (v2 — Autonomous Loop):
+  UI                →  Executor.handle_task(goal)
+  Executor          →  shows one-shot high-level approval dialog
+  User approves     →  Executor.approve_task()
+  Executor          →  spins up AgentLoopWorker in _browser_thread
+                        (SAME thread as BrowserAgent for Playwright safety)
+  AgentLoopWorker   →  Observe → Think → Act continuously
+  BrowserAgent      →  executes single actions synchronously in its thread
+  Executor          →  forwards all signals to the UI / Debug Panel
 """
 
 from PyQt5.QtCore import QObject, QThread, pyqtSignal, pyqtSlot
-from agent.planner import Planner, SYSTEM_PROMPT
-from agent.router import Router
-from agent.memory import Memory
+
+from agent.action_decider  import ActionDecider
+from agent.agent_loop      import AgentLoopWorker
+from agent.memory          import Memory
+from agent.planner         import Planner, SYSTEM_PROMPT
+from agent.router          import Router
 from agent.workflow_memory import WorkflowMemory
-from automation.browser_agent import BrowserAgent
-from automation.desktop_agent import DesktopAgent
+from automation.browser_agent  import BrowserAgent
+from automation.desktop_agent  import DesktopAgent
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# ── Planning Worker ───────────────────────────────────────────────────────────
-
-class PlanningWorker(QObject):
-    """
-    [BEGINNER GUIDE]
-    A "Worker" is like a mini-program that runs in the background.
-    This specific worker's only job is to talk to the AI (Mistral) and get a plan.
-    It uses "Signals" (finished, error) to tell the main program when it's done.
-    """
-    finished = pyqtSignal(dict) # Sent when a plan is successfully created
-    error = pyqtSignal(str)     # Sent if something goes wrong (no internet, API error)
-
-    def __init__(self, prompt: str, router: Router, planner: Planner, wf_memory: WorkflowMemory):
-        super().__init__()
-        self.prompt = prompt
-        self.router = router
-        self.planner = planner
-        self.wf_memory = wf_memory
-
-    @pyqtSlot()
-    def run(self):
-        """This runs automatically when the background thread starts."""
-        try:
-            # 1. Check Memory First (Did we already solve this problem before?)
-            cached_plan = self.wf_memory.get_cached_plan(self.prompt)
-            if cached_plan:
-                logger.info(f"Memory HIT for '{self.prompt}'. Validating cached workflow...")
-                
-                # REPAIR LAYER: Check if our old memory is still a good plan
-                repaired_plan = self.planner.validate_and_fix(self.prompt, cached_plan)
-                
-                # If we fixed it, save the better version!
-                if repaired_plan != cached_plan:
-                    logger.info("Cache Auto-Fix applied to legacy workflow. Updating memory.")
-                    self.wf_memory.save_workflow(self.prompt, repaired_plan, success=True)
-                
-                # Tell the main program: "Hey, I have a plan ready!"
-                self.finished.emit(repaired_plan)
-                return
-
-            # 2. Decide route (Local AI vs Cloud AI)
-            decision = self.router.get_routing_decision(self.prompt)
-            plan = None
-            if decision == "local":
-                plan = self.router.get_local_plan(self.prompt, SYSTEM_PROMPT)
-            
-            # 3. Fallback to Cloud AI (Mistral) if local fails or isn't used
-            if not plan:
-                logger.info("Using CLOUD (Mistral) for new plan...")
-                plan = self.planner.plan(self.prompt)
-            
-            # Tell the main program: "Hey, I have a new plan ready!"
-            self.finished.emit(plan)
-        except Exception as e:
-            # Tell the main program: "Oops, something broke."
-            self.error.emit(str(e))
-
-# ── Execution Worker ──────────────────────────────────────────────────────────
-
-class ExecutionWorker(QObject):
-    finished = pyqtSignal(str)
-    error = pyqtSignal(str)
-
-    def __init__(self, prompt: str, plan: dict, browser_agent: BrowserAgent, desktop_agent: DesktopAgent, wf_memory: WorkflowMemory):
-        super().__init__()
-        self.prompt = prompt
-        self.plan = plan
-        self.browser_agent = browser_agent
-        self.desktop_agent = desktop_agent
-        self.wf_memory = wf_memory
-
-    @pyqtSlot()
-    def run(self):
-        action = self.plan.get("action", "unknown")
-        steps = self.plan.get("steps", [])
-        try:
-            if action == "browser":
-                self.browser_agent.execute(steps)
-            elif action == "desktop":
-                self.desktop_agent.execute(steps)
-            else:
-                self.error.emit(f"Unknown action: {action}")
-                return
-            
-            # Save successful workflow to memory
-            self.wf_memory.save_workflow(self.prompt, self.plan, success=True)
-            self.finished.emit("Task completed successfully")
-        except Exception as e:
-            self.error.emit(str(e))
-
-# ── Executor ──────────────────────────────────────────────────────────────────
 
 class Executor(QObject):
-    task_started = pyqtSignal(str)
-    confirmation_required = pyqtSignal(dict)
-    task_finished = pyqtSignal(str)
-    task_error = pyqtSignal(str)
-    
-    # Dashboard Signal: event_type, message, status
-    agent_event = pyqtSignal(str, str, str)
-
-    request_browser_execution = pyqtSignal(list)
+    # ── Signals consumed by the UI ─────────────────────────────────────────────
+    task_started          = pyqtSignal(str)          # (goal) — update prompt status
+    confirmation_required = pyqtSignal(dict)         # (goal_dict) — show approval dialog
+    task_finished         = pyqtSignal(str)          # (message) — hide prompt
+    task_error            = pyqtSignal(str)          # (message) — show error state
+    clarification_needed  = pyqtSignal(str)          # (reasoning) — ask user for hint
+    agent_event           = pyqtSignal(str, str, str) # (type, message, status) → Debug Panel
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._memory = Memory()
-        self._router = Router()
-        self._planner = Planner(memory=self._memory)
-        self._wf_memory = WorkflowMemory()
-        
+
+        # Core sub-systems (stateless helpers)
+        self._memory     = Memory()
+        self._router     = Router()
+        self._planner    = Planner(memory=self._memory)
+        self._wf_memory  = WorkflowMemory()
+
+        # BrowserAgent lives in a dedicated thread — ALL Playwright ops run here
         self._browser_thread = QThread()
-        self._browser_agent = BrowserAgent(headless=False)
+        self._browser_agent  = BrowserAgent(headless=False)
         self._browser_agent.moveToThread(self._browser_thread)
         self._browser_thread.start()
-        
-        self.request_browser_execution.connect(self._browser_agent.execute)
-        self._browser_agent.action_finished.connect(self._on_execution_finished)
-        self._browser_agent.action_error.connect(self._on_execution_error)
-        self._browser_agent.status_message.connect(lambda msg: self.agent_event.emit("action", msg, "info"))
+
+        # Forward BrowserAgent status messages to the Debug Panel
+        self._browser_agent.status_message.connect(
+            lambda msg: self.agent_event.emit("action", msg, "info")
+        )
         self._browser_agent.observation_ready.connect(self._on_observation)
-        
+
         self._desktop_agent = DesktopAgent()
-        
-        self._planning_thread = None
-        self._execution_thread = None
-        self._pending_plan = None
-        self._current_prompt = None
-        logger.info("Executor ready (Timeline Enabled)")
+
+        # Agent loop bookkeeping
+        self._agent_thread:  QThread = None
+        self._agent_worker:  AgentLoopWorker = None
+        self._pending_goal:  str = None
+        self._current_goal:  str = None
+
+        logger.info("Executor ready (Autonomous Agent Loop Enabled)")
+
+    # ── Public API called by UI ────────────────────────────────────────────────
 
     @pyqtSlot(str)
     def handle_task(self, prompt: str):
-        """
-        [BEGINNER GUIDE]
-        This is called the moment you press "Enter" in the UI.
-        It starts the whole process.
-        """
-        # Make sure we aren't already busy thinking about another task
-        if (self._planning_thread and self._planning_thread.isRunning()):
-            self.task_error.emit("A task is already running.")
+        """Called when user presses Enter in the floating prompt."""
+        if self._agent_thread and self._agent_thread.isRunning():
+            self.task_error.emit("An agent task is already running. Stop it first.")
             return
 
-        self._current_prompt = prompt
-        self.task_started.emit(prompt) # Tell the UI to show "Planning..."
-        self.agent_event.emit("info", f"New Task: {prompt}", "info")
-        
-        # Check Memory First
-        cached = self._wf_memory.get_cached_plan(prompt)
-        if cached:
-            self.agent_event.emit("memory", "Cache HIT: Validating workflow...", "success")
-            
-        # ── CREATE A BACKGROUND THREAD ──
-        # We put the "Planner" into a background thread so the app doesn't freeze
-        self._planning_thread = QThread()
-        self._planner_worker = PlanningWorker(prompt, self._router, self._planner, self._wf_memory)
-        
-        # Move the worker into the new thread
-        self._planner_worker.moveToThread(self._planning_thread)
-        
-        # Connect the "wires": when thread starts, run the worker
-        self._planning_thread.started.connect(self._planner_worker.run)
-        # When worker finishes, call _on_plan_ready
-        self._planner_worker.finished.connect(self._on_plan_ready)
-        self._planner_worker.error.connect(self.task_error)
-        
-        self.agent_event.emit("planning", "🧠 Planning workflow...", "info")
-        
-        # Cleanup: when thread finishes, delete it from memory to prevent leaks
-        self._planning_thread.finished.connect(lambda: setattr(self, "_planning_thread", None))
-        self._planning_thread.finished.connect(self._planning_thread.deleteLater)
-        
-        # Finally, press the "Start" button on the thread!
-        self._planning_thread.start()
+        self._pending_goal = prompt
+        self._current_goal = prompt
+        self.task_started.emit(prompt)
+        self.agent_event.emit("info", f"📋 New goal received: {prompt}", "info")
 
-    def _on_plan_ready(self, plan: dict):
-        self._pending_plan = plan
-        steps_count = len(plan.get("steps", []))
-        self.agent_event.emit("success", f"Plan Ready: {steps_count} steps.", "success")
-        self.confirmation_required.emit(plan)
-        if self._planning_thread:
-            self._planning_thread.quit()
+        # Emit the one-shot high-level approval dialog
+        # We reuse the existing confirmation_required signal;
+        # the confirmation dialog renders the goal as a plain text description.
+        goal_dict = {
+            "action": "autonomous",
+            "goal": prompt,
+            "steps": [f"Autonomously complete: {prompt}"],
+        }
+        self.confirmation_required.emit(goal_dict)
 
     @pyqtSlot()
     def approve_plan(self):
-        if not self._pending_plan: return
+        """Called when the user approves the high-level goal. Starts the agent loop."""
+        if not self._pending_goal:
+            return
+        goal = self._pending_goal
+        self._pending_goal = None
 
-        action = self._pending_plan.get("action", "unknown")
-        steps = self._pending_plan.get("steps", [])
-        self._active_plan = self._pending_plan # Capture for memory save
-
-        self.agent_event.emit("action", f"Executing {action} workflow...", "info")
-
-        if action == "browser":
-            self.request_browser_execution.emit(steps)
-        elif action == "desktop":
-            # For desktop, we still use a small worker to ensure memory is saved
-            self._execution_thread = QThread()
-            self._exec_worker = ExecutionWorker(self._current_prompt, self._pending_plan, self._browser_agent, self._desktop_agent, self._wf_memory)
-            self._exec_worker.moveToThread(self._execution_thread)
-            self._execution_thread.started.connect(self._exec_worker.run)
-            self._exec_worker.finished.connect(self.task_finished)
-            self._exec_worker.error.connect(self.task_error)
-            self._execution_thread.finished.connect(lambda: setattr(self, "_execution_thread", None))
-            self._execution_thread.finished.connect(self._execution_thread.deleteLater)
-            self._execution_thread.start()
-        else:
-            self.task_error.emit(f"Unknown action: {action}")
-            self.agent_event.emit("error", f"Unknown action: {action}", "error")
-        
-        self._pending_plan = None
-
-    def _on_execution_finished(self, msg: str):
-        """Called when BrowserAgent finishes successfully."""
-        self.agent_event.emit("success", "Workflow completed successfully! ✅", "success")
-        if self._current_prompt and hasattr(self, "_active_plan") and self._active_plan:
-            self._wf_memory.save_workflow(self._current_prompt, self._active_plan, success=True)
-            self._active_plan = None
-        self.task_finished.emit(msg)
-
-    def _on_execution_error(self, err_msg: str):
-        self.agent_event.emit("error", f"Execution Failed: {err_msg}", "error")
-        self.task_error.emit(err_msg)
-
-    def _on_observation(self, obs):
-        msg = f"Seen: {len(obs.buttons)} buttons, {len(obs.inputs)} inputs. Title: '{obs.title}'"
-        self.agent_event.emit("observation", msg, "info")
+        self.agent_event.emit("planning", f"🚀 Launching autonomous agent for: {goal}", "info")
+        self._start_agent_loop(goal)
 
     @pyqtSlot()
     def reject_plan(self):
-        self._pending_plan = None
-        self.task_finished.emit("Task cancelled")
+        """User rejected the high-level goal approval."""
+        self._pending_goal = None
+        self.task_finished.emit("Task cancelled by user.")
+
+    @pyqtSlot()
+    def emergency_stop(self):
+        """Immediately signals the running agent loop to halt."""
+        if self._agent_worker:
+            self._agent_worker.request_stop()
+            self.agent_event.emit("error", "🛑 Emergency stop requested!", "error")
+
+    @pyqtSlot(str)
+    def provide_clarification(self, hint: str):
+        """Resume the loop after the user answered a clarification request."""
+        if self._agent_worker:
+            self._agent_worker.resume_after_clarification(hint)
+
+    @pyqtSlot()
+    def resume_intervention(self):
+        """Called when the user clicks Resume on the intervention card."""
+        if self._agent_worker:
+            self._agent_worker.resume_intervention()
+
+    @pyqtSlot()
+    def abort_intervention(self):
+        """Called when the user clicks Abort on the intervention card."""
+        self.emergency_stop()
+
+    # ── Internal: Agent Loop Lifecycle ────────────────────────────────────────
+
+    def _start_agent_loop(self, goal: str):
+        """
+        Spins up the AgentLoopWorker on the SAME thread as BrowserAgent.
+        This is the critical design choice: both workers share the Playwright
+        thread, so the loop can call browser_agent methods synchronously
+        without cross-thread Playwright access.
+        """
+        # Create the worker but move it to the existing browser thread
+        self._agent_worker = AgentLoopWorker(goal=goal, browser_agent=self._browser_agent)
+        self._agent_worker.moveToThread(self._browser_thread)
+
+        # Wire signals
+        self._agent_worker.loop_event.connect(self.agent_event)
+        self._agent_worker.loop_finished.connect(self._on_loop_finished)
+        self._agent_worker.loop_error.connect(self._on_loop_error)
+        self._agent_worker.clarification_needed.connect(self.clarification_needed)
+
+        # Start via QMetaObject.invokeMethod so it runs on _browser_thread's event loop
+        from PyQt5.QtCore import QMetaObject, Qt
+        QMetaObject.invokeMethod(self._agent_worker, "run", Qt.QueuedConnection)
+
+    # ── Slot handlers ─────────────────────────────────────────────────────────
+
+    def _on_loop_finished(self, goal: str):
+        self.agent_event.emit("success", f"✅ Autonomous task completed: {goal}", "success")
+        # Save success to workflow memory for future semantic retrieval
+        if self._current_goal:
+            plan = {"action": "autonomous", "goal": goal, "steps": []}
+            self._wf_memory.save_workflow(self._current_goal, plan, success=True)
+        self.task_finished.emit("Task completed autonomously!")
+        self._agent_worker = None
+
+    def _on_loop_error(self, error_msg: str):
+        self.agent_event.emit("error", f"❌ Agent loop failed: {error_msg}", "error")
+        self.task_error.emit(error_msg)
+        self._agent_worker = None
+
+    def _on_observation(self, obs):
+        msg = (
+            f"👁 Seen: {len(obs.buttons)} buttons, "
+            f"{len(obs.inputs)} inputs. "
+            f"Title: '{obs.title}'"
+        )
+        self.agent_event.emit("observation", msg, "info")
+
+    # ── Shutdown ──────────────────────────────────────────────────────────────
 
     def shutdown(self):
-        if self._planning_thread:
-            self._planning_thread.quit()
-            self._planning_thread.wait(1000)
+        if self._agent_worker:
+            self._agent_worker.request_stop()
         self._browser_agent.close()
         self._browser_thread.quit()
-        self._browser_thread.wait(2000)
+        self._browser_thread.wait(3000)

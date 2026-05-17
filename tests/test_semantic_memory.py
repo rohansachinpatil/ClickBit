@@ -1,13 +1,11 @@
 import pytest
-import numpy as np
 from unittest.mock import patch, MagicMock
 
 # We use the temp_memory_db fixture from conftest.py which gives an empty isolated sqlite database
 def test_semantic_similarity(temp_memory_db):
-    # Instead of actually downloading the 80MB model, we will mock the SemanticMemoryEngine
     with patch('agent.semantic_memory.SemanticMemoryEngine.encode') as mock_encode:
-        # Mock embeddings to be normalized vectors
-        mock_encode.side_effect = lambda text: np.array([1.0, 0.0] if "music" in text or "song" in text else [0.0, 1.0], dtype=np.float32)
+        # Mock embeddings to be normalized vectors as standard python lists
+        mock_encode.side_effect = lambda text: [1.0, 0.0] if "music" in text or "song" in text else [0.0, 1.0]
         
         # Save "play music"
         plan = {"action": "browser", "steps": [{"command": "open_url", "argument": "https://music.youtube.com"}]}

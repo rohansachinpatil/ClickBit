@@ -203,8 +203,20 @@ def main():
     executor.task_finished.connect(prompt.on_task_finished)
     executor.task_error.connect(prompt.on_task_error)
     
-    # When the Executor does literally anything -> Send a text message to the Debug Panel to display
+    # When the Executor does literally anything → send to Debug Panel live feed
     executor.agent_event.connect(debug_panel.add_event)
+
+    # Emergency stop: Debug Panel button → Executor
+    debug_panel.emergency_stop.connect(executor.emergency_stop)
+
+    # Intervention handling: Debug Panel card → Executor
+    debug_panel.resumeClicked.connect(executor.resume_intervention)
+    debug_panel.abortClicked.connect(executor.abort_intervention)
+
+    # Clarification needed: show in feed so user can see the question
+    executor.clarification_needed.connect(
+        lambda msg: debug_panel.add_event("info", f"❓ {msg}", "info")
+    )
 
     # ── Confirmation Logic ────────────────────────────────────────────────
     def show_confirmation(plan: dict):

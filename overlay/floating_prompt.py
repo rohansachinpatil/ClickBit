@@ -1,11 +1,9 @@
 """
 overlay/floating_prompt.py
 --------------------------
-[BEGINNER GUIDE]
-What is this file?
-This is the "Face" of ClickBit. It's the beautiful, semi-transparent text box that pops
-up when you hold the Left and Right mouse buttons. 
-It captures what you type and sends it to the Executor (the Brain) to start a task.
+ClickBit Floating Spotlight Assistant.
+Spotlight/Raycast-inspired translucent pill assistant bar.
+Derives layout visual aesthetics, glows, and animations dynamically from centralized UI State.
 """
 
 from PyQt5.QtCore import Qt, pyqtSignal, QPoint, pyqtSlot, QTimer, QPropertyAnimation, QEasingCurve
@@ -16,162 +14,196 @@ from PyQt5.QtWidgets import (
     QGraphicsDropShadowEffect, QFrame,
 )
 from utils.logger import get_logger
+from ui.theme import Colors, UIState, Typography, Spacing, Effects
+from ui.components import GlassCard, StatusOrb, IconButton, AnimatedChip
 
 logger = get_logger(__name__)
 
 class PromptLineEdit(QLineEdit):
-    """Custom line edit that handles focus/escape events if needed."""
-    def focusOutEvent(self, event):
-        super().focusOutEvent(event)
-        # Optional: hide if focus is lost
-        # self.parent().hide()
+    """Custom QLineEdit with advanced styling and escape handle."""
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.parentWidget().parentWidget().hide()
+        else:
+            super().keyPressEvent(event)
 
 class FloatingPrompt(QWidget):
     """
-    [BEGINNER GUIDE]
-    This class builds the visual window. 
-    It doesn't have a normal Windows border (FramelessWindowHint), and it stays 
-    on top of all other windows (WindowStaysOnTopHint).
+    Spotlight/Raycast hybrid translucent assistant bar.
+    Fades and slides on cursor invocation.
     """
-    # Signal emitted when user presses Enter
     task_submitted = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         
-        # 1. Set up the window rules
         self.setWindowFlags(
-            Qt.FramelessWindowHint |      # No window border or title bar
-            Qt.WindowStaysOnTopHint |     # Always float above other apps
-            Qt.Tool |                     # Don't show in the Windows taskbar
+            Qt.FramelessWindowHint |      # Frameless
+            Qt.WindowStaysOnTopHint |     # Pinned on top
+            Qt.Tool |                     # No taskbar entry
             Qt.MSWindowsFixedSizeDialogHint
         )
-        self.setAttribute(Qt.WA_TranslucentBackground) # Make the background see-through
-        self.setFixedSize(420, 150)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFixedSize(580, 150) # Extremely clean, compact spotlight proportions
         
-        # We track if we are currently "thinking" so we don't accidentally run 2 tasks at once
         self._is_planning = False
+        self._current_state = UIState.IDLE
 
         self._setup_ui()
         self._setup_animations()
 
-        # Timer to hide the window if you accidentally open it and click away
         self._hide_timer = QTimer(self)
         self._hide_timer.setSingleShot(True)
         self._hide_timer.timeout.connect(self.hide)
 
     def _setup_ui(self):
-        """Builds all the text boxes, buttons, and layouts inside the window."""
-        layout = QVBoxLayout()
-        layout.setContentsMargins(10, 10, 10, 10)
-
-        # Create a container with rounded corners and a dark glass look
-        self.container = QFrame(self)
-        self.container.setObjectName("container")
-        self.container.setStyleSheet("""
-            #container {
-                background-color: rgba(20, 20, 25, 240);
-                border: 1px solid rgba(255, 255, 255, 20);
-                border-radius: 12px;
-            }
-        """)
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(0, 0, 0, 0)
         
-        # Set up a shadow so it looks like it's floating above the screen
-        shadow = QGraphicsDropShadowEffect(self)
-        shadow.setBlurRadius(20)
-        shadow.setColor(QColor(0, 0, 0, 150))
-        shadow.setOffset(0, 5)
-        self.container.setGraphicsEffect(shadow)
+        # 1. Main outer dark glassmorphism card
+        self.card = GlassCard(self, rounded_radius=16)
+        card_layout = QVBoxLayout(self.card)
+        card_layout.setContentsMargins(Spacing.LG, Spacing.LG, Spacing.LG, Spacing.LG)
+        card_layout.setSpacing(Spacing.MD)
 
-        container_layout = QVBoxLayout(self.container)
-        container_layout.setContentsMargins(15, 15, 15, 15)
-        container_layout.setSpacing(10)
+        # 2. Main Row (Orb -> Input -> Run Button)
+        main_row = QHBoxLayout()
+        main_row.setSpacing(Spacing.MD)
 
-        # Create the title at the top
-        header_layout = QHBoxLayout()
-        self.title_label = QLabel("✨ ClickBit Assistant")
-        self.title_label.setStyleSheet("color: #aaccff; font-weight: bold; font-size: 13px; letter-spacing: 1px;")
-        
-        # Create a little status light (green circle)
-        self.status_light = QLabel()
-        self.status_light.setFixedSize(8, 8)
-        self.status_light.setStyleSheet("background-color: #00ffaa; border-radius: 4px;")
-        
-        header_layout.addWidget(self.title_label)
-        header_layout.addStretch()
-        header_layout.addWidget(self.status_light)
-        container_layout.addLayout(header_layout)
+        # A. AI Status Orb
+        self.status_orb = StatusOrb(self.card, size=20)
+        self.status_orb.set_state(UIState.IDLE)
+        main_row.addWidget(self.status_orb, 0, Qt.AlignVCenter)
 
-        # Create the actual input box where you type
-        self.input_field = PromptLineEdit(self)
+        # B. Spotlight Input Field
+        self.input_field = PromptLineEdit(self.card)
         self.input_field.setPlaceholderText("What would you like me to do?")
-        self.input_field.setStyleSheet("background: transparent; color: white; border: none; font-size: 16px;")
+        self.input_field.setStyleSheet(f"""
+            QLineEdit {{
+                background: transparent; 
+                color: {Colors.TEXT_PRIMARY}; 
+                border: none; 
+                font-family: {Typography.FAMILY};
+                font-size: 18px;
+                font-weight: 300;
+                padding: 0;
+            }}
+        """)
         self.input_field.returnPressed.connect(self._on_submit)
-        container_layout.addWidget(self.input_field)
+        main_row.addWidget(self.input_field, 1, Qt.AlignVCenter)
 
-        # Create the small status text at the bottom (e.g. "Ready")
-        self.status_label = QLabel("Ready")
-        self.status_label.setStyleSheet("color: #888888; font-size: 11px;")
-        container_layout.addWidget(self.status_label)
+        # C. Translucent Active Run Button
+        self.run_btn = QPushButton("Run", self.card)
+        self.run_btn.setCursor(Qt.PointingHandCursor)
+        self.run_btn.setFixedHeight(30)
+        self.run_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {Colors.TRANSLUCENT_WHITE};
+                color: {Colors.TEXT_PRIMARY};
+                border: 1px solid {Colors.BORDER_GLASS};
+                border-radius: 8px;
+                padding: 0 16px;
+                font-family: {Typography.FAMILY};
+                font-size: 12px;
+                font-weight: 600;
+            }}
+            QPushButton:hover {{
+                background-color: rgba(0, 0, 0, 0.08);
+                border-color: rgba(0, 0, 0, 0.12);
+            }}
+            QPushButton:pressed {{
+                background-color: rgba(0, 0, 0, 0.12);
+            }}
+        """)
+        self.run_btn.clicked.connect(self._on_submit)
+        main_row.addWidget(self.run_btn, 0, Qt.AlignVCenter)
 
-        layout.addWidget(self.container)
-        self.setLayout(layout)
+        card_layout.addLayout(main_row)
+
+        # 3. Footer Row (Action Info -> Shortcut indicator)
+        footer_row = QHBoxLayout()
+        
+        self.status_label = QLabel("ClickBit Intelligent Agent")
+        self.status_label.setStyleSheet(f"""
+            QLabel {{
+                color: {Colors.TEXT_SECONDARY};
+                font-family: {Typography.FAMILY};
+                font-size: 11px;
+                font-weight: 400;
+                background: transparent;
+                border: none;
+            }}
+        """)
+        footer_row.addWidget(self.status_label, 1, Qt.AlignVCenter)
+
+        # Inline indicator tag
+        self.shortcut_chip = AnimatedChip("Enter to Run", self.card, UIState.IDLE)
+        footer_row.addWidget(self.shortcut_chip, 0, Qt.AlignVCenter)
+
+        card_layout.addLayout(footer_row)
+        
+        root_layout.addWidget(self.card)
+        self.setLayout(root_layout)
 
     def _setup_animations(self):
-        """Sets up the smooth fade-in and slide-up animations when the window appears."""
         self.opacity_anim = QPropertyAnimation(self, b"windowOpacity")
-        self.opacity_anim.setDuration(200)
+        self.opacity_anim.setDuration(220)
         self.opacity_anim.setEasingCurve(QEasingCurve.OutCubic)
 
-        self.pos_anim = QPropertyAnimation(self, b"pos")
-        self.pos_anim.setDuration(250)
-        self.pos_anim.setEasingCurve(QEasingCurve.OutBack)
+    def _set_ui_state(self, state: str):
+        self._current_state = state
+        self.status_orb.set_state(state)
+        self.shortcut_chip.set_state(state)
+        
+        # Color borders of outer glass card depending on state
+        state_color = Colors.get_state_color(state)
+        if state != UIState.IDLE:
+            self.card.setStyleSheet(f"""
+                QFrame {{
+                    background-color: {Colors.CARD_BG};
+                    border: 1px solid rgba({QColor(state_color).red()}, {QColor(state_color).green()}, {QColor(state_color).blue()}, 0.35);
+                    border-radius: 16px;
+                }}
+            """)
+            Effects.apply_soft_glow(self.card, state_color, blur_radius=20, alpha=25)
+        else:
+            self.card.setStyleSheet(f"""
+                QFrame {{
+                    background-color: {Colors.CARD_BG};
+                    border: 1px solid {Colors.BORDER_GLASS};
+                    border-radius: 16px;
+                }}
+            """)
+            Effects.apply_ambient_shadow(self.card, blur_radius=30, alpha=20, y_offset=8)
 
     @pyqtSlot(int, int)
     def show_at(self, x: int, y: int):
-        """
-        [BEGINNER GUIDE]
-        Called automatically when you hold Left + Right mouse buttons.
-        Moves the window to your cursor's exact (x, y) location and plays an animation.
-        """
-        # If the window is already open, or we are busy thinking, don't do anything
         if self.isVisible() or self._is_planning:
             return
 
         logger.debug(f"Showing prompt at ({x}, {y})")
         
-        # Reset the input box so it's clean for the next command
         self.input_field.clear()
         self.input_field.setEnabled(True)
-        self.status_label.setText("Ready")
-        self.status_light.setStyleSheet("background-color: #00ffaa; border-radius: 4px;")
+        self.run_btn.setEnabled(True)
+        
+        self.status_label.setText("ClickBit Intelligent Agent ready")
+        self.shortcut_chip.set_text("Enter to Run")
+        self._set_ui_state(UIState.IDLE)
 
-        # Move the window slightly to the bottom right of the cursor
         target_pos = QPoint(x + 15, y + 15)
-        start_pos = target_pos + QPoint(0, 10)
 
         self.setWindowOpacity(0.0)
-        self.move(start_pos)
+        self.move(target_pos)
         self.show()
         self.activateWindow()
         self.input_field.setFocus()
 
-        # Play animations
         self.opacity_anim.setStartValue(0.0)
         self.opacity_anim.setEndValue(1.0)
-        
-        self.pos_anim.setStartValue(start_pos)
-        self.pos_anim.setEndValue(target_pos)
-
         self.opacity_anim.start()
-        self.pos_anim.start()
 
     def _on_submit(self):
-        """
-        [BEGINNER GUIDE]
-        Called when you press "Enter" inside the text box.
-        """
-        # Don't do anything if we are already busy or if you typed nothing
         if self._is_planning:
             return
             
@@ -182,42 +214,43 @@ class FloatingPrompt(QWidget):
             
         logger.info(f"Task submitted: {text}")
         
-        # Lock the UI so you can't submit twice by mashing Enter
         self._is_planning = True
         self.input_field.setEnabled(False)
-        self.status_label.setText("Submitting task...")
+        self.run_btn.setEnabled(False)
         
-        # Tell the Executor to start working on the task
+        self.status_label.setText("Thinking...")
+        self.shortcut_chip.set_text("Thinking")
+        self._set_ui_state(UIState.THINKING)
+        
         self.task_submitted.emit(text)
 
-    # ── These methods are called by the Executor to update the UI ──
+    # ── Slot triggers connected to Executor / agent loop ──
     @pyqtSlot(str)
     def on_task_started(self, prompt: str):
-        self.status_label.setText("🧠 Planning...")
-        self.status_light.setStyleSheet("background-color: #ffaa00; border-radius: 4px;")
+        self.status_label.setText("Planning autonomous steps...")
+        self.shortcut_chip.set_text("Planning")
+        self._set_ui_state(UIState.THINKING)
 
     @pyqtSlot(str)
     def on_task_finished(self, msg: str):
-        self.status_label.setText(f"✅ {msg}")
-        self.status_light.setStyleSheet("background-color: #00ffaa; border-radius: 4px;")
+        self.status_label.setText(f"Task Completed: {msg}")
+        self.shortcut_chip.set_text("Completed")
+        self._set_ui_state(UIState.SUCCESS)
         
-        # Unlock the UI so you can type a new command
         self.input_field.setEnabled(True)
         self._is_planning = False
-        self._hide_timer.start(1500)
+        self._hide_timer.start(1800)
 
     @pyqtSlot(str)
     def on_task_error(self, err_msg: str):
-        """Called when the executor reports an error."""
-        self.status_label.setText(f"❌ Error: {err_msg}")
-        self.status_label.setStyleSheet("color: #ff5555; font-size: 11px;")
-        self.status_light.setStyleSheet("background-color: #ff5555; border-radius: 4px;")
+        self.status_label.setText(f"Error: {err_msg}")
+        self.shortcut_chip.set_text("Failed")
+        self._set_ui_state(UIState.ERROR)
         
-        # Unlock the UI so you can try again
         self.input_field.setEnabled(True)
+        self.run_btn.setEnabled(True)
         self._is_planning = False
 
-    # ── Allows you to drag the window around with your mouse ──
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             self._drag_start = event.globalPos() - self.frameGeometry().topLeft()

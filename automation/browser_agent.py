@@ -13,8 +13,11 @@ and try again instead of crashing.
 
 import time
 import os
+import threading
+from typing import Optional
+from enum import Enum
 from PyQt5.QtCore import QObject, pyqtSignal, pyqtSlot
-from playwright.sync_api import sync_playwright, Page, Browser, BrowserContext
+from playwright.sync_api import sync_playwright, Page, Browser, BrowserContext, Error as PlaywrightError
 
 try:
     from playwright_stealth import stealth_sync
@@ -31,6 +34,19 @@ ACTION_DELAY = 1.0
 MAX_RETRIES = 3
 
 from automation.observer import Observer, BrowserObservation
+from automation.selector_resolver import SelectorResolver, ResolverExecutionError
+
+class BrowserSessionState(Enum):
+    DEAD = "dead"
+    STARTING = "starting"
+    READY = "ready"
+    EXECUTING = "executing"
+    RECOVERING = "recovering"
+    STOPPING = "stopping"
+
+class TransportError(Exception):
+    """Raised when the underlying Playwright transport is disconnected or corrupted."""
+    pass
 
 class BrowserAgent(QObject):
     """
@@ -49,9 +65,25 @@ class BrowserAgent(QObject):
         self._browser: Browser = None
         self._context: BrowserContext = None
         self._page: Page = None
+        
+        self._session_state = BrowserSessionState.DEAD
+        self._session_generation = 0
+        self._lifecycle_lock = threading.Lock()
+        
+        # Telemetry
+        self._recovery_count = 0
+        self._last_recovery_reason = ""
+        self._last_transport_failure = ""
+        self._session_start_time = 0
+        
         self._is_executing = False
         self._observer = Observer()
+        self._selector_resolver = SelectorResolver()
         logger.info("BrowserAgent Resilient Ready")
+
+    @property
+    def page(self) -> Optional[Page]:
+        return self._page
 
     @pyqtSlot(list)
     def execute(self, steps: list) -> None:
@@ -68,9 +100,12 @@ class BrowserAgent(QObject):
             # 1. Make sure the browser is actually open
             self._ensure_browser()
             total = len(steps)
+            start_generation = self._session_generation
             
             # Loop through the recipe step-by-step
             for i, raw_step in enumerate(steps, 1):
+                if start_generation != self._session_generation:
+                    raise RuntimeError("Session generation changed during batch execution. Aborting remaining stale steps.")
                 # Health Check: Did the user close the browser manually?
                 if not self._is_page_alive(): raise RuntimeError("Page closed.")
 
@@ -132,6 +167,10 @@ class BrowserAgent(QObject):
                 
                 return True # Success! We break out of the loop.
             
+            except ResolverExecutionError as re:
+                logger.error(f"[BrowserAgent] Resolver integration error: {re}")
+                self.status_message.emit(f"warning: ResolverExecutionError: {re}")
+                return False
             except Exception as e:
                 # Oh no, it failed! (e.g. Button not found yet)
                 logger.warning(f"Attempt {attempt} failed for [{cmd}]: {e}")
@@ -158,27 +197,18 @@ class BrowserAgent(QObject):
     def _recover_state(self):
         """
         [BEGINNER GUIDE]
-        Attempts to fix the browser if it's stuck. 
-        It waits until all network traffic stops (networkidle), meaning the page is fully loaded.
-        If the entire browser crashed (EPIPE), it fully restarts it.
+        Attempts to fix the browser if it's stuck by waiting for network idle.
+        If transport fails, the Lifecycle Manager will catch it separately.
         """
         logger.info("Stabilizing page state...")
         try:
-            # First, check if the browser process completely died (EPIPE/Disconnect)
-            if self._playwright and self._browser:
-                if not self._browser.is_connected():
-                    logger.error("Playwright transport disconnected (EPIPE). Forcing full session restart.")
-                    self._teardown_browser()
-                    self._ensure_browser()
-                    return
-
-            self._ensure_browser()
-            if self._is_page_alive():
-                self._page.wait_for_load_state("networkidle", timeout=5000)
+            self._validate_transport()
+            self._page.wait_for_load_state("networkidle", timeout=5000)
+        except TransportError:
+            # Re-raise so the outer loop handles the full session rebuild
+            raise
         except Exception as e:
-            logger.error(f"State recovery failed: {e}. Forcing session restart.")
-            self._teardown_browser()
-            self._ensure_browser()
+            logger.warning(f"State recovery (networkidle) failed: {e}")
 
     @pyqtSlot()
     def observe(self) -> None:
@@ -196,31 +226,131 @@ class BrowserAgent(QObject):
         except Exception as e:
             logger.error(f"Observation failed: {e}")
 
-    def _ensure_browser(self):
-        """Starts a new Playwright session if one doesn't exist or is corrupted."""
+    def get_current_observation(self):
+        """
+        Synchronous observation for the AgentLoop's OBSERVE phase.
+        Returns a BrowserObservation, or None if the page is not alive.
+        Called directly (not via signal) from the AgentLoopWorker thread.
+        NOTE: Both this and AgentLoopWorker run on the same Playwright thread
+              to avoid cross-thread page access.
+        """
         try:
-            if self._browser and not self._browser.is_connected():
-                logger.warning("Browser disconnected. Tearing down...")
-                self._teardown_browser()
+            self._ensure_ready()
+            obs = self._observer.get_page_state(self._page)
+            
+            # Blank-page & invalid DOM guards
+            is_blank = False
+            try:
+                url = self._page.url
+                if url == "about:blank" or url == "":
+                    is_blank = True
+            except Exception:
+                is_blank = True
                 
-            if self._playwright is None:
-                logger.info("Initializing new Playwright session...")
-                self._playwright = sync_playwright().start()
-                self._browser = self._playwright.chromium.launch(
-                    headless=self._headless, 
-                    args=["--no-sandbox", "--disable-gpu", "--no-first-run"]
-                )
-            if self._context is None:
-                self._context = self._browser.new_context(viewport={"width": 1280, "height": 800})
-            if self._page is None or self._page.is_closed():
-                self._page = self._context.new_page()
-                stealth_sync(self._page)
-        except Exception as e:
-            logger.error(f"Failed to ensure browser state: {e}")
-            self._teardown_browser()
-            raise RuntimeError("Fatal Playwright initialization error.")
+            if is_blank and self._session_generation > 0:
+                logger.warning("[BrowserAgent] Blank page detected! Restoring context...")
+                raise TransportError("Blank page detected, forcing recovery")
+                
+            if (not obs.title or obs.title == "Unknown") and not obs.buttons and not obs.inputs and not obs.text_blocks:
+                if self._session_generation > 0:
+                    logger.warning("[BrowserAgent] Invalid/Empty DOM detected! Recovering observation context.")
+                    raise TransportError("Invalid DOM state, forcing recovery")
 
-    def _teardown_browser(self):
+            # Attach current URL to the observation object for context
+            try:
+                obs.url = self._page.url
+            except Exception:
+                pass
+            return obs
+        except (PlaywrightError, TransportError) as e:
+            if "Browser has been closed" in str(e) or "Target page, context or browser has been closed" in str(e) or "EPIPE" in str(e) or isinstance(e, TransportError):
+                logger.error(f"[BrowserAgent] Transport failure during observation: {e}")
+                self._mark_session_dead(str(e))
+                self._recover_session()
+                raise TransportError("Transport recovered during observation, retry needed.") from e
+            logger.error(f"[BrowserAgent] get_current_observation failed: {e}")
+            return None
+
+    def execute_single_action(self, command: str, argument: str, expected_generation: int = None) -> None:
+        """
+        Executes ONE action through the existing resilient retry system.
+        Raises on failure so AgentLoopWorker can record it.
+        Called synchronously from AgentLoopWorker (same thread as BrowserAgent).
+        """
+        if expected_generation is not None and expected_generation != self._session_generation:
+            logger.warning(f"Rejecting stale action '{command}({argument})' from generation {expected_generation}. Current generation: {self._session_generation}")
+            raise TransportError("Stale action rejected due to transport recovery")
+            
+        try:
+            self._ensure_ready()
+            success = self._run_with_retry(command, argument)
+            if not success:
+                raise RuntimeError(f"execute_single_action: [{command}({argument})] failed after {MAX_RETRIES} retries.")
+        except (PlaywrightError, TransportError) as e:
+            if "Browser has been closed" in str(e) or "Target page, context or browser has been closed" in str(e) or "EPIPE" in str(e) or isinstance(e, TransportError):
+                logger.error(f"Transport failure detected during action: {e}")
+                self._mark_session_dead(str(e))
+                self._recover_session()
+                raise TransportError("Transport recovered, please generate a new action.") from e
+            else:
+                raise
+
+    def get_session_generation(self) -> int:
+        return self._session_generation
+
+    def _ensure_ready(self):
+        """
+        Validates browser, page, and transport health, and initializes if uninitialized or DEAD.
+        Ensures session is READY before proceeding.
+        """
+        if self._session_state == BrowserSessionState.DEAD or self._playwright is None or self._browser is None or self._page is None:
+            logger.info("[BrowserAgent] Session uninitialized or DEAD. Spin up browser runtime...")
+            self._ensure_browser()
+        self._validate_transport()
+
+    def _validate_transport(self):
+        """Validates transport health and explicitly raises if DEAD."""
+        if self._session_state == BrowserSessionState.DEAD:
+            raise TransportError("Session is DEAD")
+        if self._browser and not self._browser.is_connected():
+            raise TransportError("Browser disconnected")
+        if not self._is_page_alive():
+            raise TransportError("Page is closed")
+
+    def _mark_session_dead(self, reason: str):
+        self._session_state = BrowserSessionState.DEAD
+        self._last_transport_failure = reason
+        self.status_message.emit("🛑 Browser transport failed!")
+        logger.error(f"Session marked DEAD. Reason: {reason}")
+
+    def _recover_session(self):
+        """Full DEAD -> safe teardown -> rebuild session flow."""
+        logger.info("Starting recovery sequence...")
+        self.status_message.emit("🔄 Rebuilding browser transport layer...")
+        self._session_state = BrowserSessionState.RECOVERING
+        self._recovery_count += 1
+        self._last_recovery_reason = self._last_transport_failure
+        
+        self._safe_teardown()
+        self._ensure_browser()
+        
+        self._session_generation += 1
+        self._session_state = BrowserSessionState.READY
+        self.status_message.emit("✅ Transport layer recovered")
+        logger.info(f"Recovery complete. New session generation: {self._session_generation}")
+
+    def _safe_teardown(self):
+        """Wraps teardown in a lock to prevent concurrent closures."""
+        with self._lifecycle_lock:
+            if self._session_state == BrowserSessionState.STOPPING:
+                return
+            prev_state = self._session_state
+            self._session_state = BrowserSessionState.STOPPING
+            self._teardown_browser_impl()
+            if prev_state != BrowserSessionState.RECOVERING:
+                self._session_state = BrowserSessionState.DEAD
+
+    def _teardown_browser_impl(self):
         """Safely destroys the current Playwright session to prevent zombie processes."""
         logger.info("Tearing down Playwright session...")
         try:
@@ -241,6 +371,38 @@ class BrowserAgent(QObject):
         self._browser = None
         self._playwright = None
 
+    def _ensure_browser(self):
+        """Starts a new Playwright session under lifecycle lock."""
+        with self._lifecycle_lock:
+            try:
+                if self._browser and not self._browser.is_connected():
+                    logger.warning("Browser disconnected. Tearing down...")
+                    self._teardown_browser_impl()
+                    
+                if self._playwright is None:
+                    self._session_state = BrowserSessionState.STARTING
+                    logger.info("Initializing new Playwright session...")
+                    self._playwright = sync_playwright().start()
+                    self._browser = self._playwright.chromium.launch(
+                        headless=self._headless, 
+                        args=["--no-sandbox", "--disable-gpu", "--no-first-run"]
+                    )
+                if self._context is None:
+                    self._context = self._browser.new_context(viewport={"width": 1280, "height": 800})
+                if self._page is None or self._page.is_closed():
+                    self._page = self._context.new_page()
+                    stealth_sync(self._page)
+                
+                if self._session_state in [BrowserSessionState.STARTING, BrowserSessionState.DEAD]:
+                    self._session_state = BrowserSessionState.READY
+                    self._session_start_time = time.time()
+                    
+            except Exception as e:
+                logger.error(f"Failed to ensure browser state: {e}")
+                self._teardown_browser_impl()
+                self._session_state = BrowserSessionState.DEAD
+                raise RuntimeError("Fatal Playwright initialization error.")
+
     def _is_page_alive(self) -> bool:
         return self._page is not None and not self._page.is_closed()
 
@@ -252,6 +414,23 @@ class BrowserAgent(QObject):
 
     def _search(self, query: str):
         if self._page.url == "about:blank": self._open_url("google.com")
+        
+        # Resolve search input semantically
+        cand, conf, reason = self._selector_resolver.resolve_best_candidate(
+            self._page, "search", "search"
+        )
+        if cand and conf > 0.4:
+            self.status_message.emit(
+                f"SELECTOR_RESOLUTION: Search target: {cand.tag_name}[{cand.text or cand.placeholder}] | Confidence: {conf:.2f} | Reason: {reason}"
+            )
+            success, sel, msg = self._selector_resolver.execute_fallback_chain(
+                self._page, cand, "search", "search", query
+            )
+            if success:
+                self.status_message.emit(f"SELECTOR_RESOLUTION: Search successful via {sel}")
+                return
+
+        # Fallback to hardcoded list
         selectors = ['textarea[name="q"]', 'input[name="search_query"]', 'input[name="q"]']
         for sel in selectors:
             loc = self._page.locator(sel)
@@ -264,10 +443,43 @@ class BrowserAgent(QObject):
         self._page.keyboard.press("Enter")
 
     def _click_text(self, text: str):
+        cand, conf, reason = self._selector_resolver.resolve_best_candidate(
+            self._page, text, "click_text"
+        )
+        if cand and conf > 0.4:
+            self.status_message.emit(
+                f"SELECTOR_RESOLUTION: Click target: {cand.tag_name}[{cand.text or cand.placeholder}] | Confidence: {conf:.2f} | Reason: {reason}"
+            )
+            success, sel, msg = self._selector_resolver.execute_fallback_chain(
+                self._page, cand, text, "click"
+            )
+            if success:
+                self.status_message.emit(f"SELECTOR_RESOLUTION: Click successful via {sel}")
+                return
+
+        # Playwright's native get_by_text fallback
         self._page.get_by_text(text, exact=False).first.click(timeout=10000)
 
     def _click_index(self, index: str):
         idx = int(index) - 1
+        
+        # Retrieve all candidate interactive elements and sort by prominence
+        candidates = self._selector_resolver.gather_candidates(self._page)
+        visible_candidates = [c for c in candidates if c.is_visible]
+        
+        if 0 <= idx < len(visible_candidates):
+            cand = visible_candidates[idx]
+            self.status_message.emit(
+                f"SELECTOR_RESOLUTION: Click index {index} -> {cand.tag_name}[{cand.text or cand.placeholder}]"
+            )
+            success, sel, msg = self._selector_resolver.execute_fallback_chain(
+                self._page, cand, index, "click"
+            )
+            if success:
+                self.status_message.emit(f"SELECTOR_RESOLUTION: Click index successful via {sel}")
+                return
+
+        # Original exact selectors fallback
         selectors = ["ytd-video-renderer #video-title", "h3", "a"]
         for sel in selectors:
             locs = self._page.locator(sel)
@@ -292,12 +504,55 @@ class BrowserAgent(QObject):
                     if title_elem.is_visible():
                         title_elem.click(timeout=10000)
                         return
+        
+        # Semantic first result click
+        cand, conf, reason = self._selector_resolver.resolve_best_candidate(
+            self._page, "result", "click"
+        )
+        if cand and conf > 0.4:
+            self.status_message.emit(
+                f"SELECTOR_RESOLUTION: Click first result target: {cand.tag_name}[{cand.text}] | Conf: {conf:.2f}"
+            )
+            success, sel, msg = self._selector_resolver.execute_fallback_chain(
+                self._page, cand, "result", "click"
+            )
+            if success:
+                return
+
         self._page.locator("h3").first.click(timeout=10000)
 
     def _type_text(self, text: str):
+        # Check if active element is an input
+        is_input_active = self._page.evaluate(
+            "document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA'"
+        )
+        if is_input_active:
+            self._page.keyboard.type(text)
+            return
+
+        # Semantic typing fallback
+        cand, conf, reason = self._selector_resolver.resolve_best_candidate(
+            self._page, "input", "type"
+        )
+        if cand and conf > 0.4:
+            self.status_message.emit(
+                f"SELECTOR_RESOLUTION: Type target resolved: {cand.tag_name}[{cand.name or cand.placeholder}]"
+            )
+            success, sel, msg = self._selector_resolver.execute_fallback_chain(
+                self._page, cand, "input", "type", text
+            )
+            if success:
+                return
+
         self._page.keyboard.type(text)
+
+    def restore_url(self, url: str):
+        """Restores browser navigation to the specified URL after session recovery."""
+        logger.info(f"[BrowserAgent] restore_url requested: {url}")
+        self._ensure_ready()
+        self._open_url(url)
 
     @pyqtSlot()
     def close(self):
         """Called when the application shuts down."""
-        self._teardown_browser()
+        self._safe_teardown()

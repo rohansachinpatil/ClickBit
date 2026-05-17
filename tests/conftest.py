@@ -16,13 +16,9 @@ def temp_memory_db(tmp_path):
     import sys
     from unittest.mock import MagicMock
     
-    # Mock sentence_transformers to prevent heavy PyTorch loads in background threads
-    sys.modules['sentence_transformers'] = MagicMock()
-    
-    with patch('agent.semantic_memory.SemanticMemoryEngine.encode') as mock_encode, \
-         patch('agent.semantic_memory.SemanticMemoryEngine._get_model') as mock_model:
-        # Provide a dummy normalized vector
-        mock_encode.return_value = __import__('numpy').array([1.0, 0.0], dtype=__import__('numpy').float32)
+    with patch('agent.semantic_memory.SemanticMemoryEngine.encode') as mock_encode:
+        # Provide a dummy normalized vector as standard list
+        mock_encode.return_value = [1.0, 0.0]
         memory = WorkflowMemory(db_path=str(db_file))
         yield memory
 
